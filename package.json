@@ -37,7 +37,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "cli2mcp": "^0.1.4",
+    "execa": "^9.5.1",
     "express": "^5.2.1",
     "jose": "^6.2.7",
     "zod": "^3.25.76"

@@ -4,13 +4,12 @@
 //   serve                 Stdio transport (本地 brain + 任意 MCP-aware agent)
 //   serve --http          HTTP transport (远程共享 + Bearer/OAuth/Auth0)
 //
-// Architecture: 严格按"双 transport 模板"(提炼自 gbrain)实现。
+// Architecture:
 //   - 业务层 (createServer) 100% 复用
-//   - stdio / http 走同一个 downstream (cli2mcp npm 包)
-//   - HTTP 路径叠加 OAuth + Bearer + Rate limit + CORS + Scope-based routing
-//   - stdio 路径叠加 parent-process watchdog + idle timeout + boot timeout
-//
-// 既保留原 server.mjs 的所有能力(向后兼容),又补齐生产化缺口。
+//   - 下游 CLI: 由 src/help-parser.js 内嵌的 schema 推断 + 直接 execa spawn
+//     (不再嵌套 cli2mcp npm 包,所有 subcommand 各暴露为独立 MCP tool)
+//   - HTTP 路径叠加 OAuth + Bearer + Rate limit + CORS + IP allowlist
+//   - stdio 路径叠加 parent-process watchdog + idle timeout
 
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { dirname, resolve } from "node:path";
@@ -19,8 +18,6 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import express from "express";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -30,6 +27,8 @@ import {
   ListToolsRequestSchema,
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+import { execa } from "execa";
+import { discoverTools, buildArgv } from "./help-parser.js";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -54,13 +53,17 @@ const env = {
   CORS_ORIGINS:      (process.env.CORS_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean),
   RATE_LIMIT_RPS:    Number(process.env.RATE_LIMIT_RPS || 20),    // 每 IP 每秒
   RATE_LIMIT_BURST:  Number(process.env.RATE_LIMIT_BURST || 40),
-  TOOL_NAME:         process.env.CLI2MCP_NAME || "ripgrep",
-  CLI_COMMAND:       process.env.CLI2MCP_COMMAND || "rg",
-  CLI_CWD:           resolve(process.env.CLI2MCP_CWD || process.cwd()),
-  CLI2MCP_ENTRY:     resolve(projectRoot, "node_modules/cli2mcp/dist/index.js"),
+  // Downstream CLI: directly spawned by the gateway (no nested cli2mcp npm
+  // package). CLI2MCP_SUBCOMMANDS optionally constrains which subcommands
+  // are exposed (comma-separated). Empty = auto-discover from `--help`.
+  CLI_COMMAND:       process.env.CLI_COMMAND || process.env.CLI2MCP_COMMAND || "rg",
+  CLI_CWD:           resolve(process.env.CLI_CWD || process.env.CLI2MCP_CWD || process.cwd()),
+  CLI_SUBCOMMANDS:   (process.env.CLI_SUBCOMMANDS || process.env.CLI2MCP_SUBCOMMANDS || "")
+                      .split(",").map(v => v.trim()).filter(Boolean),
+  CLI_TIMEOUT_MS:    Number(process.env.CLI_TIMEOUT_MS || 60_000),
   // stdio-only
   STDIO_IDLE_TIMEOUT_SEC: Number(process.env.STDIO_IDLE_TIMEOUT_SEC || 0),
-  STDIO_BOOT_TIMEOUT_SEC: Number(process.env.STDIO_BOOT_TIMEOUT_SEC || 60),
+  STDIO_BOOT_TIMEOUT_SEC: Number(process.env.STDIO_BOOT_TIMEOUT_SEC || 0),
 };
 
 if (!["bearer", "oauth", "both"].includes(env.AUTH_MODE)) {
@@ -103,8 +106,12 @@ Env:
   AUTH_MODE         bearer | oauth | both (default bearer)
   MCP_TOKEN         static bearer token (default random per boot)
   PUBLIC_ENDPOINT   public https URL (required for OAuth mode)
-  CLI2MCP_COMMAND   downstream CLI command (default rg)
-  CLI2MCP_NAME      exposed tool name (default ripgrep)
+  CLI_COMMAND       downstream CLI binary (default rg)
+  CLI_CWD           working directory passed to the CLI
+  CLI_SUBCOMMANDS   optional comma-separated list of subcommands to expose
+  CLI_TIMEOUT_MS    per-call CLI timeout (default 60s)
+  ALLOWED_HOSTS     Host header allowlist (anti-DNS-rebinding)
+  MCP_ALLOWED_IPS   source-IP allowlist (comma-separated; bare IP, IP:port, CIDR)
   CORS_ORIGINS      comma-separated allowed origins
   RATE_LIMIT_RPS    per-IP rate (default 20)
   RATE_LIMIT_BURST  burst size (default 40)
@@ -127,55 +134,35 @@ if (wantHttp && wantStdio && argv.includes("--stdio") && argv.includes("--http")
   process.exit(1);
 }
 
-// ===== 3. 共用层:downstream MCP client + createServer 工厂 =====
-
-const downstream = new Client({ name: "cli2mcp-gateway-downstream", version: "1.0.0" });
-const downstreamTransport = new StdioClientTransport({
-  command: process.execPath,
-  args: [env.CLI2MCP_ENTRY, env.CLI_COMMAND, "--name", env.TOOL_NAME, "--cwd", env.CLI_CWD],
-  stderr: "pipe",
-});
-
-downstream.onerror = (error) => console.error("downstream MCP error:", error);
-downstreamTransport.onerror = (error) => console.error("downstream transport error:", error);
-
-// Downstream boot wait.
+// ===== 3. 共用层:downstream CLI 直接 spawn + createServer 工厂 =====
 //
-// Why this is 0 by default (no timeout):
-//   cli2mcp-gateway is a *client* of the downstream CLI, not a server that
-//   holds a shared engine lock. There's nothing to "wedge" — if the
-//   downstream CLI is slow to spin up (cold start, big --help output, first
-//   network request), the worst case is the gateway waits longer. A timeout
-//   here just kills the gateway and forces a supervisor restart loop, which
-//   is strictly worse than waiting.
+// Discover tools by running `<cli> --help` and `<cli> <sub> --help` for each
+// subcommand. One MCP tool per (sub)command. The gateway spawns the CLI
+// directly via execa — no nested MCP client.
 //
-//   (The original 60s default came from gbrain's serve.ts, where the
-//   *server* holds a PGLite write lock and a wedged boot starves every
-//   other CLI consumer. Different problem, different fix.)
-//
-// Override with STDIO_BOOT_TIMEOUT_SEC=N if you really want a deadline.
-// 0 = wait forever (default).
-env.STDIO_BOOT_TIMEOUT_SEC = env.STDIO_BOOT_TIMEOUT_SEC || DEFAULT_BOOT_TIMEOUT_SEC;
+// STDIO_BOOT_TIMEOUT_SEC only applies to the initial discovery phase
+// (default: 0 = wait forever; we don't want to crash-loop the gateway if
+// the CLI is slow to print --help).
 
-// Optional deadline (only active when STDIO_BOOT_TIMEOUT_SEC > 0)
+env.STDIO_BOOT_TIMEOUT_SEC = env.STDIO_BOOT_TIMEOUT_SEC ?? 0;
+
 let bootTimeoutHandle = null;
 if (env.STDIO_BOOT_TIMEOUT_SEC > 0) {
   bootTimeoutHandle = setTimeout(() => {
-    console.error(`[boot] downstream connect exceeded ${env.STDIO_BOOT_TIMEOUT_SEC}s — exiting non-zero`);
+    console.error(`[boot] downstream CLI discovery exceeded ${env.STDIO_BOOT_TIMEOUT_SEC}s — exiting non-zero`);
     process.exit(2);
   }, env.STDIO_BOOT_TIMEOUT_SEC * 1000);
 }
 
-await downstream.connect(downstreamTransport);
-const discovered = await downstream.listTools();
+const tools = await discoverTools(env.CLI_COMMAND, env.CLI_SUBCOMMANDS.length > 0 ? env.CLI_SUBCOMMANDS : null);
 if (bootTimeoutHandle) clearTimeout(bootTimeoutHandle);
 
-const tools = discovered.tools.filter((tool) => tool.name === env.TOOL_NAME);
-if (tools.length !== 1) {
-  console.error(`Expected exactly one allowlisted tool (${env.TOOL_NAME}), got ${tools.map(t => t.name).join(", ")}`);
+if (tools.length === 0) {
+  console.error(`[boot] no tools discovered for "${env.CLI_COMMAND}". Does it support --help?`);
   process.exit(1);
 }
 const allowedTools = new Set(tools.map((tool) => tool.name));
+const toolByName = new Map(tools.map(tool => [tool.name, tool]));
 
 // 共用业务层:无论 stdio 还是 http 都用这个 createServer
 function createServer() {
@@ -183,13 +170,34 @@ function createServer() {
     { name: "cli2mcp-gateway", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+  }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args = {} } = request.params;
-    if (!allowedTools.has(name)) {
-      throw new Error(`Tool not allowlisted: ${name}`);
+    const { name, arguments: callArgs = {} } = request.params;
+    const tool = toolByName.get(name);
+    if (!tool) throw new Error(`Tool not allowlisted: ${name}`);
+    const argv = [env.CLI_COMMAND];
+    if (tool.dispatch.subcommand) argv.push(tool.dispatch.subcommand);
+    argv.push(...buildArgv(tool.dispatch.shape, callArgs));
+    const r = await execa(env.CLI_COMMAND,
+      tool.dispatch.subcommand ? [tool.dispatch.subcommand, ...buildArgv(tool.dispatch.shape, callArgs)] : buildArgv(tool.dispatch.shape, callArgs),
+      {
+        cwd: env.CLI_CWD,
+        timeout: env.CLI_TIMEOUT_MS,
+        reject: false,
+        env: process.env,
+        input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
+      }
+    );
+    if (r.exitCode !== 0) {
+      const errText = (r.stderr || r.stdout || "").trim();
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
+      };
     }
-    return downstream.callTool({ name, arguments: args });
+    return { content: [{ type: "text", text: r.stdout || "" }] };
   });
   return server;
 }
@@ -240,13 +248,12 @@ async function runStdio() {
     console.error(`[stdio] received ${signal} — shutting down`);
     clearInterval(parentCheckInterval);
     await server.close().catch(() => {});
-    await downstream.close().catch(() => {});
     process.exit(0);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-  console.error(`[stdio] cli2mcp-gateway (stdio) — tool=${env.TOOL_NAME}`);
+  console.error(`[stdio] cli2mcp-gateway (stdio) — tools=${[...allowedTools].join(", ")}`);
 }
 
 // ===== 5. transport:http =====
@@ -484,7 +491,7 @@ async function runHttp() {
     authMode: env.AUTH_MODE,
     toolNames: [...allowedTools],
     uptimeSec: Math.floor(process.uptime()),
-    downstreamConnected: Boolean(downstreamTransport),
+    cliResolved: Boolean(env.CLI_COMMAND),
   }));
 
   if (oauthNeeded) {
@@ -632,16 +639,14 @@ async function runHttp() {
     });
     // 2) 关所有 MCP transport(等活跃 stream 写完)
     const transportClosePromises = [...transports.values()].map(t => t.close().catch(() => {}));
-    // 3) 关 downstream(释放 CLI 子进程)
-    const downstreamClose = downstream.close().catch(() => {});
-    // 4) 兜底:10 秒强制退出
+    // 3) 兜底:10 秒强制退出
     const forceExit = setTimeout(() => {
       console.error("[shutdown] timeout — forcing exit");
       process.exit(1);
     }, 10_000);
     forceExit.unref();
 
-    await Promise.allSettled([...transportClosePromises, downstreamClose]);
+    await Promise.allSettled(transportClosePromises);
     clearTimeout(forceExit);
     console.log("[shutdown] clean exit");
     process.exit(0);
