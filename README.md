@@ -37,11 +37,47 @@ Requires Node.js ≥ 20.
 
 The default. Lets any MCP-aware HTTP client reach your CLI remotely.
 
+### Option A: local install + .env file
+
 ```bash
-cp .env.example .env
-# edit .env — see "Configuration" below
+git clone https://github.com/drtx32/cli2mcp-gateway.git
+cd cli2mcp-gateway
+npm install
+cp .env.example .env   # then edit .env
 npm start
 ```
+
+### Option B: global install + env vars on the command line (no .env file)
+
+```bash
+npm install -g drtx32/cli2mcp-gateway
+
+# one-shot start with env inline:
+MCP_TOKEN=ph_token_12345678 \
+CLI2MCP_COMMAND=parsehub \
+CLI2MCP_NAME=parsehub \
+CLI2MCP_CWD=/tmp/parsehub-downloads \
+HOST=127.0.0.1 \
+PORT=3101 \
+PUBLIC_ENDPOINT=http://127.0.0.1:3101 \
+cli2mcp-gateway serve --http
+```
+
+Or export once into your shell profile (`~/.zshrc` / `~/.bashrc`):
+
+```bash
+export MCP_TOKEN=ph_token_12345678
+export CLI2MCP_COMMAND=parsehub
+export CLI2MCP_NAME=parsehub
+export CLI2MCP_CWD=/tmp/parsehub-downloads
+export HOST=127.0.0.1
+export PORT=3101
+export PUBLIC_ENDPOINT=http://127.0.0.1:3101
+
+cli2mcp-gateway serve --http
+```
+
+The `.env` file is purely a convenience — every variable it can hold can be passed via the shell instead.
 
 Sanity check:
 
