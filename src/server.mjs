@@ -47,6 +47,10 @@ const env = {
   OAUTH_USERNAME:    process.env.OAUTH_USERNAME || "admin",
   OAUTH_PASSWORD:    process.env.OAUTH_PASSWORD || "change-me",
   ALLOWED_HOSTS:     (process.env.ALLOWED_HOSTS || "").split(",").map(v => v.trim()).filter(Boolean),
+  // IP allowlist. Comma-separated, accepts bare IP or IP:port.
+  // Examples: "161.33.195.100" or "161.33.195.100:3101,10.0.0.0/8".
+  // Empty = allow all (rely on bearer / OAuth alone).
+  ALLOWED_IPS:       (process.env.MCP_ALLOWED_IPS || process.env.ALLOWED_IPS || "").split(",").map(v => v.trim()).filter(Boolean),
   CORS_ORIGINS:      (process.env.CORS_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean),
   RATE_LIMIT_RPS:    Number(process.env.RATE_LIMIT_RPS || 20),    // 每 IP 每秒
   RATE_LIMIT_BURST:  Number(process.env.RATE_LIMIT_BURST || 40),
@@ -359,6 +363,120 @@ async function runHttp() {
       if (rateBuckets.get(ip).lastRefill < cutoff) rateBuckets.delete(ip);
     }
   }, 5 * 60_000).unref();
+
+  // ===== IP allowlist (env.MCP_ALLOWED_IPS / env.ALLOWED_IPS) =====
+  // When set, drops requests whose socket remote address doesn't match any
+  // entry. Entries may be:
+  //   "1.2.3.4"             — exact IP
+  //   "1.2.3.4:3101"        — exact IP:port (both must match)
+  //   "10.0.0.0/8"          — CIDR (IPv4 only for now; IPv6 /nn supported)
+  // Comparison handles IPv4-mapped IPv6 (::ffff:1.2.3.4).
+  function ipToBigInt(ip) {
+    // Returns a number for IPv4, bigint for IPv6. /0 catch-all returns null.
+    if (ip.includes(":")) {
+      // IPv6
+      if (ip === "::" || ip === "0:0:0:0:0:0:0:0") return 0n;
+      const parts = ip.split("::");
+      const head = (parts[0] || "").split(":").filter(Boolean);
+      const tail = (parts[1] || "").split(":").filter(Boolean);
+      const fill = 8 - head.length - tail.length;
+      if (fill < 0) return null;
+      const full = [...head, ...Array(fill).fill("0"), ...tail];
+      const normalized = full.map(p => p.padStart(4, "0")).join("");
+      try { return BigInt("0x" + normalized); } catch { return null; }
+    }
+    // IPv4
+    const octets = ip.split(".");
+    if (octets.length !== 4) return null;
+    let v = 0n;
+    for (const o of octets) {
+      const n = Number(o);
+      if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+      v = (v << 8n) | BigInt(n);
+    }
+    return v;
+  }
+  function ipv4MappedToV4(ip) {
+    // ::ffff:1.2.3.4 -> 1.2.3.4
+    const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
+    return m ? m[1] : ip;
+  }
+  const allowedIpRules = env.ALLOWED_IPS.map(entry => {
+    let cidr = null;
+    let port = null;
+    let bare = null;
+    if (entry.includes("/")) {
+      const [base, prefixStr] = entry.split("/");
+      const prefix = Number(prefixStr);
+      if (!Number.isInteger(prefix)) return null;
+      const ipNum = ipToBigInt(ipv4MappedToV4(base));
+      if (ipNum === null) return null;
+      const isV6 = base.includes(":");
+      const maxBits = isV6 ? 128 : 32;
+      if (prefix < 0 || prefix > maxBits) return null;
+      const mask = ((1n << BigInt(maxBits - prefix)) - 1n) ^ ((1n << BigInt(maxBits)) - 1n);
+      cidr = { ipNum, mask, isV6 };
+    } else if (entry.includes(":")) {
+      // Could be IP:port (IPv4) or bare IPv6
+      const lastColon = entry.lastIndexOf(":");
+      const maybePort = Number(entry.slice(lastColon + 1));
+      if (Number.isInteger(maybePort) && maybePort >= 0 && maybePort <= 65535
+          && !entry.slice(0, lastColon).includes(":")) {
+        // IPv4:port
+        const ipNum = ipToBigInt(entry.slice(0, lastColon));
+        if (ipNum === null) return null;
+        bare = { ipNum, port: maybePort };
+      } else {
+        // Bare IPv6
+        const ipNum = ipToBigInt(entry);
+        if (ipNum === null) return null;
+        bare = { ipNum, port: null };
+      }
+    } else {
+      // Bare IPv4 (possibly with :port)
+      const lastColon = entry.lastIndexOf(":");
+      if (lastColon >= 0) {
+        const maybePort = Number(entry.slice(lastColon + 1));
+        if (Number.isInteger(maybePort) && maybePort >= 0 && maybePort <= 65535) {
+          const ipNum = ipToBigInt(entry.slice(0, lastColon));
+          if (ipNum === null) return null;
+          bare = { ipNum, port: maybePort };
+          return bare;
+        }
+      }
+      const ipNum = ipToBigInt(entry);
+      if (ipNum === null) return null;
+      bare = { ipNum, port: null };
+    }
+    return cidr || bare;
+  }).filter(Boolean);
+
+  if (allowedIpRules.length > 0) {
+    app.use((req, res, next) => {
+      const remote = req.ip || req.socket.remoteAddress || "";
+      const clientIp = ipv4MappedToV4(remote);
+      const clientPort = req.socket.remotePort;
+      const clientNum = ipToBigInt(clientIp);
+      const matched = allowedIpRules.some(rule => {
+        if (rule.mask !== undefined) {
+          // CIDR
+          const sameFamily = (rule.isV6 && clientIp.includes(":"))
+            || (!rule.isV6 && !clientIp.includes(":"));
+          if (!sameFamily) return false;
+          return clientNum !== null && (clientNum & rule.mask) === rule.ipNum;
+        }
+        // Bare / IP:port
+        if (clientNum === null || clientNum !== rule.ipNum) return false;
+        if (rule.port !== null && rule.port !== clientPort) return false;
+        return true;
+      });
+      if (!matched) {
+        res.status(403).json({ error: "ip_not_allowed" });
+        return;
+      }
+      next();
+    });
+  }
 
   // ----- 5.3 Routes -----
   app.get("/health", (_req, res) => res.json({
