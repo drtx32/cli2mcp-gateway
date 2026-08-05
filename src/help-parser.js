@@ -273,34 +273,60 @@ export function buildArgv(shape, args) {
  *
  * If `subcommands` is null/empty, falls back to a single tool that wraps the
  * whole CLI (legacy mode).
+ *
+ * A synthetic `<cli>_help` tool is always prepended. It runs `<cli> [--sub] --help`
+ * on demand and returns the raw help text — the agent's primary way to learn
+ * what's available without burning output budget on broad enumeration tools.
  */
 export async function discoverTools(baseCmd, subcommands = null) {
+  const base = baseCmd.replace(/^.*\//, "").replace(/[^A-Za-z0-9_-]/g, "_");
   const topHelp = await captureHelp(baseCmd, []);
   const subs = subcommands && subcommands.length > 0
     ? subcommands
     : parseSubcommandNames(topHelp);
 
+  const out = [];
+
+  // Synthetic "help" meta-tool — ALWAYS listed first so the agent sees it before
+  // any concrete subcommand tool. Cheap to call, never truncated.
+  out.push({
+    name: `${base}_help`,
+    description:
+      "Gateway meta-tool: run the wrapped CLI's --help and return its full text. " +
+      "Call this first when you need to discover what the CLI offers or what arguments a particular subcommand takes. " +
+      "Prefer this over calling high-level subcommands blindly to avoid wasted tool calls.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sub: { type: "string", description: "Optional subcommand name. Omit for top-level help." },
+        args: { type: "array", items: { type: "string" }, description: "Extra args (e.g. ['--format=json']). Forwarded verbatim." },
+      },
+      additionalProperties: false,
+    },
+    dispatch: { kind: "help" },  // marker; server.mjs routes this specially
+  });
+
   if (subs.length === 0) {
     // No subcommands: treat the whole CLI as one tool
     const shape = parseSubcommandSchema(topHelp);
-    return [{
-      name: baseCmd.replace(/^.*\//, "").replace(/[^A-Za-z0-9_-]/g, "_"),
-      description: topHelp.split("\n")[0] || `Wraps ${baseCmd}`,
+    out.push({
+      name: base,
+      description: (topHelp.split("\n")[0] || `Wraps ${baseCmd}`) + " Use the help tool for the full schema.",
       inputSchema: toInputSchema(shape),
       dispatch: { subcommand: null, shape },
-    }];
+    });
+    return out;
   }
 
   // One tool per subcommand
-  const out = [];
   for (const sub of subs) {
     const helpText = await captureHelp(baseCmd, [sub]);
     if (!helpText.trim()) continue; // subcommand rejects --help, skip
     const shape = parseSubcommandSchema(helpText);
     const firstLine = helpText.split(/\r?\n/).find(l => l.trim() && !l.startsWith("usage:")) || `${baseCmd} ${sub}`;
     out.push({
-      name: `${baseCmd.replace(/^.*\//, "").replace(/[^A-Za-z0-9_-]/g, "_")}_${sub}`,
-      description: firstLine.trim(),
+      name: `${base}_${sub}`,
+      description: firstLine.trim() + " Use the help tool with sub=\"" + sub + "\" for the full schema.",
       inputSchema: toInputSchema(shape),
       dispatch: { subcommand: sub, shape },
     });

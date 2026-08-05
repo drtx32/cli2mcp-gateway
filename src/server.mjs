@@ -61,6 +61,7 @@ const env = {
   CLI_SUBCOMMANDS:   (process.env.CLI_SUBCOMMANDS || process.env.CLI2MCP_SUBCOMMANDS || "")
                       .split(",").map(v => v.trim()).filter(Boolean),
   CLI_TIMEOUT_MS:    Number(process.env.CLI_TIMEOUT_MS || 60_000),
+  CLI_MAX_OUTPUT_BYTES: Number(process.env.CLI_MAX_OUTPUT_BYTES || 16_000),
   // stdio-only
   STDIO_IDLE_TIMEOUT_SEC: Number(process.env.STDIO_IDLE_TIMEOUT_SEC || 0),
   STDIO_BOOT_TIMEOUT_SEC: Number(process.env.STDIO_BOOT_TIMEOUT_SEC || 0),
@@ -110,6 +111,7 @@ Env:
   CLI_CWD           working directory passed to the CLI
   CLI_SUBCOMMANDS   optional comma-separated list of subcommands to expose
   CLI_TIMEOUT_MS    per-call CLI timeout (default 60s)
+  CLI_MAX_OUTPUT_BYTES  per-call stdout byte cap before truncation (default 16 KB). The synthetic help tool is exempt.
   ALLOWED_HOSTS     Host header allowlist (anti-DNS-rebinding)
   MCP_ALLOWED_IPS   source-IP allowlist (comma-separated; bare IP, IP:port, CIDR)
   CORS_ORIGINS      comma-separated allowed origins
@@ -177,12 +179,32 @@ function createServer() {
     const { name, arguments: callArgs = {} } = request.params;
     const tool = toolByName.get(name);
     if (!tool) throw new Error(`Tool not allowlisted: ${name}`);
-    const argv = [env.CLI_COMMAND];
+
+    // Synthetic "help" tool: run `<cli> [sub] --help [extra args]` and return
+    // raw text. This is the agent's primary way to discover what's available
+    // without burning output budget on broad enumeration tools.
+    if (tool.dispatch.kind === "help") {
+      const argv = [];
+      if (typeof callArgs.sub === "string" && callArgs.sub) argv.push(callArgs.sub);
+      argv.push("--help");
+      if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
+      const r = await execa(env.CLI_COMMAND, argv, {
+        cwd: env.CLI_CWD,
+        timeout: env.CLI_TIMEOUT_MS,
+        reject: false,
+        env: process.env,
+      });
+      // help tool returns full text (no truncation) — its whole purpose is to
+      // reveal schema without budget concerns.
+      const text = (r.stdout || r.stderr || "").trim()
+        || `(${env.CLI_COMMAND} ${callArgs.sub || ""} --help produced no output)`;
+      return { content: [{ type: "text", text }] };
+    }
+
+    const argv = [];
     if (tool.dispatch.subcommand) argv.push(tool.dispatch.subcommand);
     argv.push(...buildArgv(tool.dispatch.shape, callArgs));
-    const r = await execa(env.CLI_COMMAND,
-      tool.dispatch.subcommand ? [tool.dispatch.subcommand, ...buildArgv(tool.dispatch.shape, callArgs)] : buildArgv(tool.dispatch.shape, callArgs),
-      {
+    const r = await execa(env.CLI_COMMAND, argv, {
         cwd: env.CLI_CWD,
         timeout: env.CLI_TIMEOUT_MS,
         reject: false,
@@ -197,7 +219,16 @@ function createServer() {
         content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
       };
     }
-    return { content: [{ type: "text", text: r.stdout || "" }] };
+
+    // Truncate very large stdout. Help tool already short-circuited above and
+    // is exempt; every other tool gets the same budget.
+    let text = r.stdout || "";
+    const maxBytes = env.CLI_MAX_OUTPUT_BYTES;
+    if (text.length > maxBytes) {
+      const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${maxBytes} shown. Re-run with a narrower scope — e.g. pass a specific subcommand to the help tool, or target a single item — to get a smaller result.]`;
+      text = text.slice(0, maxBytes) + hint;
+    }
+    return { content: [{ type: "text", text }] };
   });
   return server;
 }
