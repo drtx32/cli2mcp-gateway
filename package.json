@@ -1,0 +1,45 @@
+{
+  "name": "cli2mcp-gateway",
+  "version": "1.0.0",
+  "description": "Wrap any CLI as a Streamable HTTP MCP server with bearer / OAuth 2.1 / Auth0 auth, CORS, and rate limiting.",
+  "main": "src/server.mjs",
+  "type": "module",
+  "bin": {
+    "cli2mcp-gateway": "src/server.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs serve --http",
+    "stdio": "node src/server.mjs serve",
+    "health": "node -e \"fetch('http://127.0.0.1:3101/health').then(r=>r.json()).then(console.log).catch(e=>{console.error(e.message);process.exit(1)})\""
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "cli",
+    "wrapper",
+    "http",
+    "stdio",
+    "oauth",
+    "bearer",
+    "express"
+  ],
+  "author": "drtx32",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drtx32/cli2mcp-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/drtx32/cli2mcp-gateway/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "cli2mcp": "^0.1.4",
+    "express": "^5.2.1",
+    "jose": "^6.2.7",
+    "zod": "^3.25.76"
+  }
+}
