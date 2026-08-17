@@ -1,6 +1,6 @@
 {
   "name": "cli2mcp-gateway",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Wrap any CLI as a Streamable HTTP MCP server with bearer / OAuth 2.1 / Auth0 auth, CORS, and rate limiting.",
   "main": "src/server.mjs",
   "type": "module",

@@ -198,7 +198,13 @@ function createServer() {
       // reveal schema without budget concerns.
       const text = (r.stdout || r.stderr || "").trim()
         || `(${env.CLI_COMMAND} ${callArgs.sub || ""} --help produced no output)`;
-      return { content: [{ type: "text", text }] };
+      const target = `${env.CLI_COMMAND}${callArgs.sub ? ` ${callArgs.sub}` : ""} --help`;
+      const header = [
+        `Help for ${env.CLI_COMMAND}${callArgs.sub ? ` ${callArgs.sub}` : ""}.`,
+        `Use this meta-tool to inspect the CLI, or pass "sub" and "args" to drill down into a subcommand help page.`,
+        `Raw output from ${target}:`,
+      ].join("\n");
+      return { content: [{ type: "text", text: `${header}\n\n${text}` }] };
     }
 
     const argv = [];
