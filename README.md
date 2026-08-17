@@ -11,12 +11,14 @@
 
 | Transport | Use case | Entry point |
 |---|---|---|
-| **stdio** | Local agents (Claude Code, Codex, Cursor) spawning one process per session | `node src/server.mjs serve` |
-| **HTTP** | Remote agents hitting a shared bearer / OAuth / Auth0 endpoint | `node src/server.mjs serve --http` |
+| **stdio** | Local agents (Claude Code, Codex, Cursor) spawning one process per session | `cli2mcp-gateway serve` |
+| **HTTP** | Remote agents hitting a shared bearer / OAuth / Auth0 endpoint | `cli2mcp-gateway serve --http` |
 
 The business layer (`createServer`) is shared between transports. Only the transport plumbing differs.
 
 The CLI is spawned directly via `execa()` — no nested MCP client, no extra process hop. Schema inference lives in `src/help-parser.js`.
+
+> Windows note: the published command uses a small Node launcher so `cli2mcp-gateway` runs as a program instead of opening `src/server.mjs` in an editor.
 
 ### Example: `parsehub` becomes 4 MCP tools
 
@@ -86,6 +88,15 @@ export PUBLIC_ENDPOINT=http://127.0.0.1:3101
 cli2mcp-gateway serve --http
 ```
 
+### `serve` flags
+
+`serve` accepts only these mode switches:
+
+- `--http` to use HTTP transport
+- `--stdio` to force stdio transport
+
+If you pass neither flag, `serve` defaults to stdio. `winapp` is not a supported subcommand.
+
 The `.env` file is purely a convenience — every variable it can hold can be passed via the shell instead.
 
 Sanity check:
@@ -136,7 +147,7 @@ Or via Claude Code / Codex MCP config:
   "mcpServers": {
     "my-cli": {
       "command": "node",
-      "args": ["/path/to/cli2mcp-gateway/src/server.mjs", "serve"]
+      "args": ["/path/to/cli2mcp-gateway/bin/cli2mcp-gateway.cjs", "serve"]
     }
   }
 }
