@@ -48,21 +48,70 @@ export function toolNameForPath(base, commandPath) {
 
 /**
  * List top-level subcommands from a top-level --help. Looks for the
- * "positional arguments:\n  command\n    <name> ..." block (argparse)
- * or the "Commands:" block (commander/cobra). Returns an array of names.
+ * "positional arguments:\n  command\n    <name> ..." block (argparse),
+ * the "Commands:" block (commander/cobra), and Typer/Rich-style boxed
+ * tables where each subcommand sits on a `│` row inside a `╭─ Commands ─╮`
+ * panel. Returns an array of names.
  */
 export function parseSubcommandNames(helpText) {
   const lines = helpText.split(/\r?\n/);
   const out = [];
   let inPositional = false;
   let inCommands = false;
+  let inRichPanel = false;
   let blockIndent = null;
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
     const stripped = raw.replace(/\s+$/, "");
-    if (/^positional arguments:\s*$/i.test(stripped)) { inPositional = true; inCommands = false; continue; }
-    if (isCommandSectionHeader(stripped))             { inCommands   = true; inPositional = false; continue; }
+    if (/^positional arguments:\s*$/i.test(stripped)) { inPositional = true; inCommands = false; inRichPanel = false; continue; }
+    if (isCommandSectionHeader(stripped))             { inCommands   = true; inPositional = false; inRichPanel = false; continue; }
+
+    // Typer / Rich panel: top/bottom borders use box-drawing characters and
+    // the panel title sits between the dashes (e.g. `╭─ Commands ─...─╮`).
+    // Each subcommand row starts with `│` followed by the command name and
+    // a description. Skip the border lines themselves.
+    //
+    // We ONLY mine subcommand rows from panels whose title contains
+    // "Commands". Typer/Rich also emits `╭─ Options ─...╮` and `╭─ Args ─...╮`
+    // panels whose continuation rows can leak token names like "json"
+    // (from `--format <df|records|json|yaml>`) into the result and trigger
+    // runaway recursion — so be strict about the panel kind.
+    const richOpenMatch = /^╭─\s*([^─]+?)\s*─/.exec(stripped);
+    if (richOpenMatch) {
+      const title = richOpenMatch[1].trim().toLowerCase();
+      inRichPanel = title === "commands";
+      inPositional = false;
+      inCommands = false;
+      continue;
+    }
+    if (/^╰─/.test(stripped)) { inRichPanel = false; continue; }
+    if (inRichPanel) {
+      // In Typer/Rich Commands panels, subcommand rows have the form
+      //   `│ name   description...`
+      // where name starts exactly one space after the leading `│`. Wrapped
+      // description rows (e.g. `│                            Args:`,
+      // `│                    DataFrame。`) start many spaces after `│` —
+      // never exactly one. So the layout marker `^│ ` (one and only one
+      // space) is the reliable discriminator.
+      //
+      // We also reject anything starting with `*` (Typer's required-flag
+      // marker is `│ *  --flag  desc`, never used inside a Commands panel
+      // for subcommand names) and anything where the "name" begins with
+      // `-` (a flag, not a subcommand).
+      const richMatch = /^│( )([^ │][^│]*)/.exec(stripped);
+      if (richMatch) {
+        const tail = richMatch[2].trimStart();
+        const nameMatch = /^([A-Za-z_][\w-]*)\b/.exec(tail);
+        if (nameMatch) {
+          const name = nameMatch[1];
+          if (name !== "command" && !out.includes(name)) out.push(name);
+          continue;
+        }
+      }
+      // Continuation rows and any other content inside the panel: ignore.
+      continue;
+    }
 
     if (inPositional || inCommands) {
       // Exit block when we hit the next section header (no leading whitespace, ends with ':')
