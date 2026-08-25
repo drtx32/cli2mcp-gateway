@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node bin/cli2mcp-gateway.cjs serve --http",
     "stdio": "node bin/cli2mcp-gateway.cjs serve",
+    "test": "node --test",
     "health": "node -e \"fetch('http://127.0.0.1:3101/health').then(r=>r.json()).then(console.log).catch(e=>{console.error(e.message);process.exit(1)})\""
   },
   "keywords": [

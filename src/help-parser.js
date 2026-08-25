@@ -27,13 +27,23 @@ export async function captureHelp(cmd, args = [], timeoutMs = 5_000) {
       timeout: timeoutMs,
       reject: false,
       env: process.env,
-      cwd: process.env.CLI2MCP_CWD || process.cwd(),
+      cwd: process.env.CLI_CWD || process.env.CLI2MCP_CWD || process.cwd(),
     });
     return [r.stdout || "", r.stderr || ""].filter(Boolean).join("\n");
   } catch (err) {
     // Some CLIs exit non-zero on --help; ignore if we got text.
     return err?.stdout || err?.stderr || "";
   }
+}
+
+function isCommandSectionHeader(line) {
+  return /^(commands|available commands|subcommands):\s*$/i.test(line);
+}
+
+export function toolNameForPath(base, commandPath) {
+  if (!Array.isArray(commandPath) || commandPath.length === 0) return base;
+  if (commandPath.length === 1) return `${base}_${commandPath[0]}`;
+  return `${base}_${commandPath.join("__")}`;
 }
 
 /**
@@ -52,11 +62,11 @@ export function parseSubcommandNames(helpText) {
     const raw = lines[i];
     const stripped = raw.replace(/\s+$/, "");
     if (/^positional arguments:\s*$/i.test(stripped)) { inPositional = true; inCommands = false; continue; }
-    if (/^commands:\s*$/i.test(stripped))              { inCommands   = true; inPositional = false; continue; }
+    if (isCommandSectionHeader(stripped))             { inCommands   = true; inPositional = false; continue; }
 
     if (inPositional || inCommands) {
       // Exit block when we hit the next section header (no leading whitespace, ends with ':')
-      if (/^\S.*:\s*$/.test(stripped) && !/^positional arguments:/i.test(stripped) && !/^commands:/i.test(stripped)) {
+      if (/^\S.*:\s*$/.test(stripped) && !/^positional arguments:/i.test(stripped) && !isCommandSectionHeader(stripped)) {
         inPositional = false; inCommands = false; continue;
       }
       // Subcommand heading line. Match the first whitespace-separated token at
@@ -77,7 +87,44 @@ export function parseSubcommandNames(helpText) {
  * Parse one argparse-style block (positional arguments + options).
  * Returns { positionals: [{name, description, variadic}], flags: [{long, short, type, description, choices?, repeatable?}] }
  */
-export function parseSubcommandSchema(helpText) {
+function inferUsagePositionals(helpText, commandPath = []) {
+  const usageLine = helpText.split(/\r?\n/).find((line) => /^usage:\s*/i.test(line.trim()));
+  if (!usageLine) return [];
+
+  const tokens = usageLine.replace(/^usage:\s*/i, "").trim().split(/\s+/).filter(Boolean);
+  let start = -1;
+  if (commandPath.length > 0) {
+    for (let i = 0; i <= tokens.length - commandPath.length; i++) {
+      if (commandPath.every((part, idx) => tokens[i + idx] === part)) {
+        start = i + commandPath.length;
+        break;
+      }
+    }
+  }
+
+  const remainder = tokens.slice(start >= 0 ? start : 0);
+  const positionals = [];
+  for (const token of remainder) {
+    if (/^\[.*\]$/.test(token) && !/^\[[A-Z][A-Z0-9_]*\.\.\.\]$/.test(token)) {
+      // Optional wrappers like [OPTIONS] or [ARGS] are ignored here.
+      continue;
+    }
+    if (/^--?/.test(token)) continue;
+
+    const cleaned = token.replace(/^\[+/, "").replace(/\]+$/, "");
+    if (!cleaned) continue;
+    if (!/^[A-Z][A-Z0-9_]*(?:\.\.\.)?$/.test(cleaned) && !/^<[^>]+>$/.test(cleaned)) continue;
+
+    positionals.push({
+      name: cleaned.replace(/\.\.\.$/, ""),
+      description: "",
+      variadic: /\.\.\.$/.test(cleaned),
+    });
+  }
+  return positionals;
+}
+
+export function parseSubcommandSchema(helpText, commandPath = []) {
   const lines = helpText.split(/\r?\n/);
   const positionals = [];
   const flags = [];
@@ -106,10 +153,10 @@ export function parseSubcommandSchema(helpText) {
 
     // Section headers
     if (/^positional arguments:\s*$/i.test(stripped)) { flush(); section = "positional"; continue; }
-    if (/^options:\s*$/i.test(stripped))              { flush(); section = "options"; continue; }
+    if (/^(options|flags):\s*$/i.test(stripped))      { flush(); section = "options"; continue; }
     // Exit when next section starts
     if (section && /^[A-Z][A-Za-z][A-Za-z _-]*:\s*$/.test(stripped)
-        && !/^positional arguments:/i.test(stripped) && !/^options:/i.test(stripped)) {
+        && !/^positional arguments:/i.test(stripped) && !/^(options|flags):/i.test(stripped)) {
       flush(); section = null; continue;
     }
 
@@ -129,51 +176,50 @@ export function parseSubcommandSchema(helpText) {
       // Flag line. Tokenize, but treat commas as flag separators (argparse
       // writes `-o PATH, --output-dir PATH` on one row).
       flush();
-      // Tokenize. Commas AND whitespace separate tokens; we want only the
-      // flag / arg-hint tokens, not the separators themselves.
-      const tokens = body.split(/[\s,]+/).filter(Boolean);
-      const flagGroup = [];
-      for (let j = 0; j < tokens.length; j++) {
-        const tok = tokens[j];
-        const fm = /^(-[A-Za-z]|--[A-Za-z][\w-]*)$/.exec(tok);
-        if (!fm) continue;
-        // Short-only flags (-h) and long-only flags (--help) both need a stable
-        // property name in the JSON Schema. Prefer the long form; fall back
-        // to the short form so the client always has a usable key.
-        const long = tok.startsWith("--") ? tok.slice(2) : null;
-        const short = tok.startsWith("--") ? null : tok.slice(1);
-        const propName = long || short;
-        const f = {
-          long: propName,
-          short,
-          type: "boolean",
-          description: "",
-          choices: null,
-          repeatable: false,
-        };
-        // Look ahead for an arg hint. If present, the flag takes a value
-        // (string type) and the hint can carry choices / required-info.
-        const next = tokens[j + 1];
-        if (next && /^[A-Z][A-Z0-9_]+$/.test(next)) {
-          // ALL_CAPS = required value (argparse convention)
-          f.type = "string";
-          j += 1;
-        } else if (next && /^[a-z][\w-]+$/.test(next)) {
-          // Lowercase hint: still treat as value (commander / cobra convention)
-          f.type = "string";
-          j += 1;
-        } else if (next && /^\[.+\]$/.test(next)) {
-          // [CHOICE|OTHER] optional with choices
-          f.type = "string";
-          const inner = next.slice(1, -1);
-          if (/^[A-Za-z|]+$/.test(inner)) f.choices = inner.split("|");
-          j += 1;
+      const [spec, ...descParts] = body.split(/\s{2,}/);
+      const fragments = spec.split(/\s*,\s*/).filter(Boolean);
+      const aliases = [];
+      let type = "boolean";
+      let choices = null;
+
+      for (const fragment of fragments) {
+        const fragMatch = /^(-[A-Za-z]|--[A-Za-z][\w-]*)(?:\s+(\[[^\]]+\]|[A-Z][A-Z0-9_]+|[a-z][\w-]+))?$/.exec(fragment.trim());
+        if (!fragMatch) continue;
+        const tok = fragMatch[1];
+        const hint = fragMatch[2];
+        const alias = tok.startsWith("--") ? tok.slice(2) : tok.slice(1);
+        aliases.push(alias);
+        if (hint) {
+          type = "string";
+          if (/^\[[^\]]+\]$/.test(hint)) {
+            const inner = hint.slice(1, -1);
+            if (/^[A-Za-z|]+$/.test(inner)) choices = inner.split("|");
+          }
         }
-        flagGroup.push(f);
       }
-      cur = flagGroup[0] || null;
-      if (flagGroup.length > 1 && cur) {
-        cur.description = `(aliases: ${flagGroup.slice(1).map(f => (f.short ? `-${f.short}` : "") + (f.long ? `--${f.long}` : "")).join(", ")}) `;
+
+      const canonical = aliases.find((alias) => alias.includes("-"))
+        || aliases[aliases.length - 1]
+        || null;
+      if (!canonical) continue;
+
+      cur = {
+        long: canonical,
+        short: aliases.find((alias) => alias.length === 1) || null,
+        type,
+        description: descParts.join(" ").trim(),
+        choices,
+        repeatable: false,
+      };
+      if (aliases.length > 1) {
+        const aliasList = aliases
+          .filter((alias) => alias !== canonical)
+          .map((alias) => (alias.length === 1 ? `-${alias}` : `--${alias}`))
+          .join(", ");
+        if (aliasList) cur.description = `${cur.description ? `${cur.description} ` : ""}(aliases: ${aliasList})`;
+      }
+      if (!cur.description && fragments.length === 1) {
+        cur.description = "";
       }
       continue;
     }
@@ -207,6 +253,10 @@ export function parseSubcommandSchema(helpText) {
   // help shows trailing ellipsis or repetition words, treat as variadic.
   if (positionals.length === 1 && /(\.\.\.|可多个|多个)/.test(positionals[0].description)) {
     positionals[0].variadic = true;
+  }
+
+  if (positionals.length === 0) {
+    positionals.push(...inferUsagePositionals(helpText, commandPath));
   }
 
   return { positionals, flags };
@@ -278,10 +328,11 @@ export function buildArgv(shape, args) {
  * on demand and returns the raw help text — the agent's primary way to learn
  * what's available without burning output budget on broad enumeration tools.
  */
-export async function discoverTools(baseCmd, subcommands = null) {
+export async function discoverTools(baseCmd, subcommands = null, options = {}) {
   const base = baseCmd.replace(/^.*\//, "").replace(/[^A-Za-z0-9_-]/g, "_");
-  const topHelp = await captureHelp(baseCmd, []);
-  const subs = subcommands && subcommands.length > 0
+  const captureHelpFn = options.captureHelpFn || captureHelp;
+  const topHelp = await captureHelpFn(baseCmd, []);
+  const roots = subcommands && subcommands.length > 0
     ? subcommands
     : parseSubcommandNames(topHelp);
 
@@ -298,7 +349,12 @@ export async function discoverTools(baseCmd, subcommands = null) {
     inputSchema: {
       type: "object",
       properties: {
-        sub: { type: "string", description: "Optional subcommand name. Omit for top-level help." },
+        commandPath: {
+          type: "array",
+          items: { type: "string" },
+          description: "Preferred: full command path to drill into, e.g. ['jygs', 'industrial-chains'].",
+        },
+        sub: { type: "string", description: "Legacy alias for a single subcommand name. Prefer commandPath." },
         args: { type: "array", items: { type: "string" }, description: "Extra args (e.g. ['--format=json']). Forwarded verbatim." },
       },
       additionalProperties: false,
@@ -306,30 +362,44 @@ export async function discoverTools(baseCmd, subcommands = null) {
     dispatch: { kind: "help" },  // marker; server.mjs routes this specially
   });
 
-  if (subs.length === 0) {
-    // No subcommands: treat the whole CLI as one tool
-    const shape = parseSubcommandSchema(topHelp);
+  async function walk(commandPath) {
+    const helpText = await captureHelpFn(baseCmd, commandPath);
+    if (!helpText.trim()) return;
+    const subcommands = parseSubcommandNames(helpText);
+    if (subcommands.length > 0) {
+      for (const sub of subcommands) {
+        await walk([...commandPath, sub]);
+      }
+      return;
+    }
+
+    const shape = parseSubcommandSchema(helpText, commandPath);
+    const firstLine = helpText.split(/\r?\n/).find(l => l.trim() && !l.startsWith("usage:")) || `${baseCmd} ${commandPath.join(" ")}`;
+    out.push({
+      name: toolNameForPath(base, commandPath),
+      description: firstLine.trim() + (commandPath.length > 0
+        ? ` Use the help tool with commandPath=[${commandPath.map(v => JSON.stringify(v)).join(", ")}] for the full schema.`
+        : " Use the help tool for the full schema."),
+      inputSchema: toInputSchema(shape),
+      dispatch: { commandPath, shape },
+    });
+  }
+
+  if (roots.length === 0) {
+    // No subcommands: treat the whole CLI as one tool.
+    const shape = parseSubcommandSchema(topHelp, []);
     out.push({
       name: base,
       description: (topHelp.split("\n")[0] || `Wraps ${baseCmd}`) + " Use the help tool for the full schema.",
       inputSchema: toInputSchema(shape),
-      dispatch: { subcommand: null, shape },
+      dispatch: { commandPath: [], shape },
     });
     return out;
   }
 
-  // One tool per subcommand
-  for (const sub of subs) {
-    const helpText = await captureHelp(baseCmd, [sub]);
-    if (!helpText.trim()) continue; // subcommand rejects --help, skip
-    const shape = parseSubcommandSchema(helpText);
-    const firstLine = helpText.split(/\r?\n/).find(l => l.trim() && !l.startsWith("usage:")) || `${baseCmd} ${sub}`;
-    out.push({
-      name: `${base}_${sub}`,
-      description: firstLine.trim() + " Use the help tool with sub=\"" + sub + "\" for the full schema.",
-      inputSchema: toInputSchema(shape),
-      dispatch: { subcommand: sub, shape },
-    });
+  for (const root of roots) {
+    const commandPath = Array.isArray(root) ? root : [root];
+    await walk(commandPath);
   }
   return out;
 }

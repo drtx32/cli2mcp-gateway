@@ -185,7 +185,10 @@ function createServer() {
     // without burning output budget on broad enumeration tools.
     if (tool.dispatch.kind === "help") {
       const argv = [];
-      if (typeof callArgs.sub === "string" && callArgs.sub) argv.push(callArgs.sub);
+      const commandPath = Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0
+        ? callArgs.commandPath
+        : (typeof callArgs.sub === "string" && callArgs.sub ? [callArgs.sub] : []);
+      if (commandPath.length > 0) argv.push(...commandPath);
       argv.push("--help");
       if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
       const r = await execa(env.CLI_COMMAND, argv, {
@@ -196,19 +199,23 @@ function createServer() {
       });
       // help tool returns full text (no truncation) — its whole purpose is to
       // reveal schema without budget concerns.
+      const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
       const text = (r.stdout || r.stderr || "").trim()
-        || `(${env.CLI_COMMAND} ${callArgs.sub || ""} --help produced no output)`;
-      const target = `${env.CLI_COMMAND}${callArgs.sub ? ` ${callArgs.sub}` : ""} --help`;
+        || `(${env.CLI_COMMAND}${commandPathText} --help produced no output)`;
+      const target = `${env.CLI_COMMAND}${commandPathText} --help`;
       const header = [
-        `Help for ${env.CLI_COMMAND}${callArgs.sub ? ` ${callArgs.sub}` : ""}.`,
-        `Use this meta-tool to inspect the CLI, or pass "sub" and "args" to drill down into a subcommand help page.`,
+        `Help for ${env.CLI_COMMAND}${commandPathText}.`,
+        `Use this meta-tool to inspect the CLI, or pass "commandPath" (preferred) or "sub" plus "args" to drill down into a command help page.`,
         `Raw output from ${target}:`,
       ].join("\n");
       return { content: [{ type: "text", text: `${header}\n\n${text}` }] };
     }
 
     const argv = [];
-    if (tool.dispatch.subcommand) argv.push(tool.dispatch.subcommand);
+    const commandPath = Array.isArray(tool.dispatch.commandPath)
+      ? tool.dispatch.commandPath
+      : (tool.dispatch.subcommand ? [tool.dispatch.subcommand] : []);
+    if (commandPath.length > 0) argv.push(...commandPath);
     argv.push(...buildArgv(tool.dispatch.shape, callArgs));
     const r = await execa(env.CLI_COMMAND, argv, {
         cwd: env.CLI_CWD,

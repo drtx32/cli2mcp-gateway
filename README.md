@@ -7,7 +7,7 @@
 
 ## What it does
 
-`cli2mcp-gateway` wraps any CLI as an MCP server. On startup it runs `<cli> --help` and `<cli> <sub> --help` for each subcommand, infers a JSON Schema, and exposes **one MCP tool per (sub)command**.
+`cli2mcp-gateway` wraps any CLI as an MCP server. On startup it runs `<cli> --help` and then walks nested command trees with `<cli> <path...> --help` until it reaches a leaf command, infers a JSON Schema, and exposes **one MCP tool per leaf command**.
 
 | Transport | Use case | Entry point |
 |---|---|---|
