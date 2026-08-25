@@ -268,6 +268,13 @@ The CLI runs in whatever directory you point it at via `CLI_CWD` — no `sandbox
 
 ---
 
+## TODO
+
+- [ ] Normalize generated MCP tool names to identifier-safe names: convert `-` and other non-identifier characters in CLI command path segments to `_` for the MCP-facing tool name, while preserving the original CLI command path for dispatch. Example: `ashare jygs industrial-chains` → MCP tool `ashare_jygs__industrial_chains`, with dispatch path `['jygs', 'industrial-chains']`.
+- [ ] Add regression tests covering nested commands with hyphens to ensure tool discovery, `tools/list`, and `tools/call` remain compatible across MCP clients that map tool names to language-level function identifiers.
+
+---
+
 ## License
 
 MIT © drtx32
