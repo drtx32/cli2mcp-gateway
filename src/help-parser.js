@@ -366,7 +366,7 @@ export function buildArgv(shape, args) {
 }
 
 /**
- * Top-level entrypoint: given a base command (e.g. "parsehub") and an
+ * Run `<cli> --help` (and recursive subcommand --help) and, given an
  * optional list of subcommand names, return an array of MCP tool specs:
  *   [{ name, description, inputSchema, dispatch: { subcommand, shape } }]
  *
@@ -376,14 +376,24 @@ export function buildArgv(shape, args) {
  * A synthetic `<cli>_help` tool is always prepended. It runs `<cli> [--sub] --help`
  * on demand and returns the raw help text — the agent's primary way to learn
  * what's available without burning output budget on broad enumeration tools.
+ *
+ * If `options.dualToolMode === true`, no recursive expansion happens. Only
+ * `<cli>_help` and `<cli>_run` are exposed — `<cli>_run` lets the agent invoke
+ * any subcommand (including nested ones) without per-subcommand MCP tools.
+ * Use this for CLIs whose top-level subcommands are just command groupings
+ * (e.g. `multica issue create`) and where per-tool schema inference yields
+ * empty/incorrect schemas.
  */
 export async function discoverTools(baseCmd, subcommands = null, options = {}) {
   const base = baseCmd.replace(/^.*\//, "").replace(/[^A-Za-z0-9_-]/g, "_");
   const captureHelpFn = options.captureHelpFn || captureHelp;
+  const dualToolMode = options.dualToolMode === true;
   const topHelp = await captureHelpFn(baseCmd, []);
-  const roots = subcommands && subcommands.length > 0
-    ? subcommands
-    : parseSubcommandNames(topHelp);
+  const roots = dualToolMode
+    ? []
+    : (subcommands && subcommands.length > 0
+        ? subcommands
+        : parseSubcommandNames(topHelp));
 
   const out = [];
 
@@ -410,6 +420,38 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
     },
     dispatch: { kind: "help" },  // marker; server.mjs routes this specially
   });
+
+  if (dualToolMode) {
+    // Synthetic "run" meta-tool — mirrors `_help` but executes the command
+    // instead of appending --help. Lets the agent reach any subcommand path
+    // (including nested ones) that per-tool schema inference couldn't resolve.
+    out.push({
+      name: `${base}_run`,
+      description:
+        "Gateway meta-tool: run the wrapped CLI with the given command path and args. " +
+        "Use this when no per-subcommand tool is exposed (CLI_DUAL_TOOL_MODE=true) or when you need to invoke a nested subcommand. " +
+        "Prefer calling the `_help` tool first to inspect flags/arguments, then pass them via `args`.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          commandPath: {
+            type: "array",
+            items: { type: "string" },
+            description: "Command path, e.g. ['issue', 'create']. Empty for top-level.",
+          },
+          args: {
+            type: "array",
+            items: { type: "string" },
+            description: "Args forwarded verbatim after the command path, e.g. ['--title', 'X', '--output', 'json'].",
+          },
+          stdin: { type: "string", description: "Optional: piped into the CLI's stdin." },
+        },
+        additionalProperties: false,
+      },
+      dispatch: { kind: "run" },  // marker; server.mjs routes this specially
+    });
+    return out;
+  }
 
   async function walk(commandPath) {
     const helpText = await captureHelpFn(baseCmd, commandPath);

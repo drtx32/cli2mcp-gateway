@@ -62,6 +62,11 @@ const env = {
                       .split(",").map(v => v.trim()).filter(Boolean),
   CLI_TIMEOUT_MS:    Number(process.env.CLI_TIMEOUT_MS || 60_000),
   CLI_MAX_OUTPUT_BYTES: Number(process.env.CLI_MAX_OUTPUT_BYTES || 16_000),
+  // When true, only expose `<cli>_help` and `<cli>_run`. Skip the recursive
+  // per-subcommand tool expansion. Useful for CLIs whose top-level subcommands
+  // are just command groupings (e.g. `multica issue create`) and where per-tool
+  // schema inference yields empty/incorrect schemas.
+  CLI_DUAL_TOOL_MODE: ["1", "true", "yes"].includes(String(process.env.CLI_DUAL_TOOL_MODE || "").toLowerCase()),
   // stdio-only
   STDIO_IDLE_TIMEOUT_SEC: Number(process.env.STDIO_IDLE_TIMEOUT_SEC || 0),
   STDIO_BOOT_TIMEOUT_SEC: Number(process.env.STDIO_BOOT_TIMEOUT_SEC || 0),
@@ -112,6 +117,7 @@ Env:
   CLI_SUBCOMMANDS   optional comma-separated list of subcommands to expose
   CLI_TIMEOUT_MS    per-call CLI timeout (default 60s)
   CLI_MAX_OUTPUT_BYTES  per-call stdout byte cap before truncation (default 16 KB). The synthetic help tool is exempt.
+  CLI_DUAL_TOOL_MODE 1|true|yes — skip recursive subcommand tool expansion. Only expose `<cli>_help` and `<cli>_run` (the latter executes any subcommand via commandPath+args). Useful when top-level subcommands are command groupings (e.g. multica issue create) and per-tool schema inference yields empty schemas.
   ALLOWED_HOSTS     Host header allowlist (anti-DNS-rebinding)
   MCP_ALLOWED_IPS   source-IP allowlist (comma-separated; bare IP, IP:port, CIDR)
   CORS_ORIGINS      comma-separated allowed origins
@@ -156,7 +162,11 @@ if (env.STDIO_BOOT_TIMEOUT_SEC > 0) {
   }, env.STDIO_BOOT_TIMEOUT_SEC * 1000);
 }
 
-const tools = await discoverTools(env.CLI_COMMAND, env.CLI_SUBCOMMANDS.length > 0 ? env.CLI_SUBCOMMANDS : null);
+const tools = await discoverTools(
+  env.CLI_COMMAND,
+  env.CLI_SUBCOMMANDS.length > 0 ? env.CLI_SUBCOMMANDS : null,
+  { dualToolMode: env.CLI_DUAL_TOOL_MODE },
+);
 if (bootTimeoutHandle) clearTimeout(bootTimeoutHandle);
 
 if (tools.length === 0) {
@@ -209,6 +219,37 @@ function createServer() {
         `Raw output from ${target}:`,
       ].join("\n");
       return { content: [{ type: "text", text: `${header}\n\n${text}` }] };
+    }
+
+    // Synthetic "run" tool (dual-tool mode): execute `<cli> <commandPath...> <args...>`
+    // verbatim, no --help appended. Lets the agent reach nested subcommands that
+    // per-tool schema inference can't represent.
+    if (tool.dispatch.kind === "run") {
+      const argv = [];
+      const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
+      if (commandPath.length > 0) argv.push(...commandPath);
+      if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
+      const r = await execa(env.CLI_COMMAND, argv, {
+        cwd: env.CLI_CWD,
+        timeout: env.CLI_TIMEOUT_MS,
+        reject: false,
+        env: process.env,
+        input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
+      });
+      if (r.exitCode !== 0) {
+        const errText = (r.stderr || r.stdout || "").trim();
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
+        };
+      }
+      let text = r.stdout || "";
+      const maxBytes = env.CLI_MAX_OUTPUT_BYTES;
+      if (text.length > maxBytes) {
+        const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${maxBytes} shown. Re-run with a narrower scope to get a smaller result.]`;
+        text = text.slice(0, maxBytes) + hint;
+      }
+      return { content: [{ type: "text", text }] };
     }
 
     const argv = [];

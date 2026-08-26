@@ -209,3 +209,56 @@ test("parseSubcommandNames does not treat wrapped description rows as new subcom
     "tradingview",
   ]);
 });
+
+test("discoverTools dualToolMode exposes only <cli>_help and <cli>_run and skips recursion", async () => {
+  // In dualToolMode the recursive walker must be bypassed entirely — the
+  // tool list is exactly two synthetic tools regardless of what the
+  // wrapped CLI's --help says.
+  const helpByPath = new Map([
+    [JSON.stringify([]), `
+Usage: multica [OPTIONS] COMMAND [ARGS]...
+
+CORE COMMANDS
+  issue:        Work with issues
+  workspace:    Work with workspaces
+`],
+    [JSON.stringify(["issue"]), `
+Usage: multica issue [OPTIONS] COMMAND [ARGS]...
+
+COMMANDS
+  create:    Create a new issue
+  list:      List issues
+`],
+  ]);
+
+  const tools = await discoverTools(
+    "multica",
+    null,
+    {
+      dualToolMode: true,
+      captureHelpFn: async (_cmd, commandPath) => {
+        const key = JSON.stringify(commandPath);
+        return helpByPath.get(key) || "";
+      },
+    },
+  );
+
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    ["multica_help", "multica_run"],
+  );
+
+  const runTool = tools.find((tool) => tool.name === "multica_run");
+  assert.equal(runTool.dispatch.kind, "run");
+  // run tool must NOT have any schema fields that would suggest per-tool expansion
+  assert.equal(runTool.inputSchema.additionalProperties, false);
+  assert.equal(runTool.inputSchema.properties.commandPath.type, "array");
+  assert.equal(runTool.inputSchema.properties.commandPath.items.type, "string");
+  assert.equal(runTool.inputSchema.properties.args.type, "array");
+  assert.equal(runTool.inputSchema.properties.args.items.type, "string");
+  assert.equal(runTool.inputSchema.properties.stdin.type, "string");
+
+  // Sanity: help tool still works in dualToolMode (drill-down signature)
+  const helpTool = tools.find((tool) => tool.name === "multica_help");
+  assert.equal(helpTool.dispatch.kind, "help");
+});
