@@ -32,6 +32,7 @@ import { discoverTools, buildArgv } from "./help-parser.js";
 import { loadBoxConfig, legacyEnvConfig, configSummary } from "./box-config.mjs";
 import { aggregateTools, buildDispatchTable, resolveToolCall } from "./tool-aggregator.mjs";
 import { discoverStdioMcp } from "./adapters/mcp-stdio.mjs";
+import { buildServiceEnv } from "./service-env.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -381,7 +382,7 @@ function createServer() {
     const serviceCwd = svc.cwd || env.CLI_CWD;
     const serviceTimeout = svc.timeout_ms || env.CLI_TIMEOUT_MS;
     const serviceMaxBytes = svc.max_output_bytes || env.CLI_MAX_OUTPUT_BYTES;
-    const serviceEnv = { ...process.env, ...(svc.env || {}) };
+    const serviceEnv = buildServiceEnv(process.env, svc.env || {});
 
     // mcp-stdio adapter: forward the call through the per-service MCP client
     // we set up at boot. No subprocess spawn here — the stdio MCP server is
@@ -423,6 +424,7 @@ function createServer() {
         timeout: serviceTimeout,
         reject: false,
         env: serviceEnv,
+        extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
       });
       const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
       const text = (r.stdout || r.stderr || "").trim()
@@ -449,6 +451,7 @@ function createServer() {
         timeout: serviceTimeout,
         reject: false,
         env: serviceEnv,
+        extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
         input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
       });
       if (r.exitCode !== 0) {
@@ -477,6 +480,7 @@ function createServer() {
         timeout: serviceTimeout,
         reject: false,
         env: serviceEnv,
+        extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
         input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
       }
     );
