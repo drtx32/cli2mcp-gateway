@@ -262,3 +262,34 @@ COMMANDS
   const helpTool = tools.find((tool) => tool.name === "multica_help");
   assert.equal(helpTool.dispatch.kind, "help");
 });
+
+test("discoverTools skipRecursive: emits one tool per top-level subcommand without recursing", async () => {
+  // Synthetic --help output with two top-level subs; skipRecursive should
+  // not invoke help for either sub — just use parseSubcommandNames on the
+  // top-level help text. The synthetic `cli_help` meta-tool is always
+  // prepended, so we expect 3 tools total: cli_help, cli_build, cli_test.
+  const helpByPath = new Map([
+    [JSON.stringify([]), `
+Usage: cli [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  build    Compile stuff
+  test     Run test suite
+`],
+  ]);
+  const tools = await discoverTools("cli", null, {
+    skipRecursive: true,
+    captureHelpFn: async (_cmd, args) => helpByPath.get(JSON.stringify(args)) || "",
+  });
+  assert.equal(tools.length, 3);
+  assert.deepEqual(tools.map(t => t.name).sort(), ["cli_build", "cli_help", "cli_test"]);
+  for (const t of tools) {
+    if (t.name === "cli_help") continue;  // synthetic help meta-tool, no dispatch
+    assert.deepEqual(t.dispatch.commandPath, [t.name.replace(/^cli_/, "")]);
+    assert.equal(t.inputSchema.type, "object");
+  }
+  // Sanity: only the top-level help should have been captured, not the
+  // per-sub helps (which weren't even present in helpByPath).
+  const captured = [...helpByPath.keys()];
+  assert.deepEqual(captured, [JSON.stringify([])]);
+});
