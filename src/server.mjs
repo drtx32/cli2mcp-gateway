@@ -43,8 +43,13 @@ const env = {
   AUTH0_ISSUER:      (process.env.AUTH0_ISSUER || "").replace(/\/$/, ""),
   AUTH0_AUDIENCE:    process.env.AUTH0_AUDIENCE || "",
   AUTH0_REQ_SCOPE:   process.env.AUTH0_REQUIRED_SCOPE || "parsehub:use",
+  // OAuth 2.1 password grant uses OAUTH_USERNAME / OAUTH_PASSWORD. We refuse
+// to fall back to a default credential — it would make every gateway with
+// `AUTH_MODE=oauth` accidentally share the same admin login. Operators must
+// set OAUTH_PASSWORD (and ideally OAUTH_USERNAME) explicitly or stick with
+// AUTH_MODE=bearer. Check is lazy and only fires when oauth is actually used.
   OAUTH_USERNAME:    process.env.OAUTH_USERNAME || "admin",
-  OAUTH_PASSWORD:    process.env.OAUTH_PASSWORD || "change-me",
+  OAUTH_PASSWORD:    process.env.OAUTH_PASSWORD || "", // Empty default; validated below in `resolveOAuthPassword()`.
   ALLOWED_HOSTS:     (process.env.ALLOWED_HOSTS || "").split(",").map(v => v.trim()).filter(Boolean),
   // IP allowlist. Comma-separated, accepts bare IP or IP:port.
   // Examples: "161.33.195.100" or "161.33.195.100:3101,10.0.0.0/8".
@@ -93,6 +98,14 @@ const oauthNeeded = ["oauth", "both"].includes(env.AUTH_MODE) || Boolean(env.AUT
 if (oauthNeeded && !env.PUBLIC_ENDPOINT.startsWith("https://")
     && env.HOST !== "127.0.0.1" && env.HOST !== "localhost") {
   console.error("OAuth public deployments require PUBLIC_ENDPOINT=https://...");
+  process.exit(1);
+}
+// Lazy validation of OAUTH_PASSWORD — only fail when OAuth flow actually runs.
+if (oauthNeeded && env.AUTH_MODE !== "both" && !Boolean(env.AUTH0_ISSUER)
+    && (!env.OAUTH_PASSWORD || env.OAUTH_PASSWORD.length === 0)) {
+  console.error("[boot] OAUTH_PASSWORD not set. Refusing to start with insecure default. " +
+    "Either set OAUTH_PASSWORD (and OAUTH_USERNAME) in the environment, " +
+    "or use AUTH_MODE=bearer / AUTH_MODE=both (no password required).");
   process.exit(1);
 }
 
@@ -571,13 +584,21 @@ async function runHttp() {
   }
 
   // ----- 5.3 Routes -----
-  app.get("/health", (_req, res) => res.json({
+  // /health: minimal info for LB probes. toolNames are *internal* structure
+  // (subcommand lists, namespaced tool ids) — exposing them unauthenticated is
+  // a side-channel leak. Opt in with HEALTH_EXPOSE_DETAILS=1 if you really
+  // need them (e.g. dev/debug). Same for cliResolved — could disclose which
+  // CLI the gateway is wrapping to a probing attacker.
+  const healthBody = {
     ok: true,
     authMode: env.AUTH_MODE,
-    toolNames: [...allowedTools],
     uptimeSec: Math.floor(process.uptime()),
-    cliResolved: Boolean(env.CLI_COMMAND),
-  }));
+  };
+  if (process.env.HEALTH_EXPOSE_DETAILS === "1") {
+    healthBody.toolNames = [...allowedTools];
+    healthBody.cliResolved = Boolean(env.CLI_COMMAND);
+  }
+  app.get("/health", (_req, res) => res.json(healthBody));
 
   if (oauthNeeded) {
     app.get("/.well-known/oauth-protected-resource", (_req, res) => res.json({
