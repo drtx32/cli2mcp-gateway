@@ -31,8 +31,7 @@ import { execa } from "execa";
 import { discoverTools, buildArgv } from "./help-parser.js";
 import { loadBoxConfig, legacyEnvConfig, configSummary } from "./box-config.mjs";
 import { aggregateTools, buildDispatchTable, resolveToolCall } from "./tool-aggregator.mjs";
-import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { discoverStdioMcp } from "./adapters/mcp-stdio.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -296,31 +295,7 @@ const perServiceTools = {};
 /** @type {Record<string, { callTool: (name: string, args: any) => Promise<any>, close: () => Promise<void> }>} */
 const perServiceCallers = {};
 
-async function discoverStdioMcpTools(serviceName, command, args, env, cwd) {
-  const transport = new StdioClientTransport({
-    command,
-    args: args || [],
-    env: { ...process.env, ...(env || {}) },
-    cwd: cwd || process.cwd(),
-    stderr: "inherit",  // forward to our stderr; prevents pipe-buffer deadlock
-  });
-  const client = new McpClient(
-    { name: `cli2mcp-gateway-bridge/${serviceName}`, version: "1.0.0" },
-    { capabilities: {} },
-  );
-  await client.connect(transport);
-  const { tools } = await client.listTools();
-  // Map MCP tool format into the aggregator-friendly format. Dispatch goes
-  // through `perServiceCallers[serviceName].callTool`.
-  return { client, tools: tools.map(t => ({
-    name: t.name,
-    description: t.description ?? "",
-    inputSchema: t.inputSchema ?? { type: "object", properties: {} },
-  })) };
-}
-
 for (const [serviceName, svc] of Object.entries(box.config.services)) {
-  console.error(`[boot] discovering service: ${serviceName} (adapter=${svc.adapter})`);
   if (svc.adapter === "cli") {
     const subcmds = svc.subcommands && svc.subcommands.length > 0 ? svc.subcommands : null;
     // dual_tool_mode can be set on the service directly (preferred) or via
@@ -341,17 +316,17 @@ for (const [serviceName, svc] of Object.entries(box.config.services)) {
       { dualToolMode: dualMode, skipRecursive: skipRec, cwd: svc.cwd },
     );
   } else if (svc.adapter === "mcp-stdio") {
-    const { client, tools } = await discoverStdioMcpTools(
-      serviceName,
-      svc.command,
-      svc.args || [],
-      svc.env || {},
-      svc.cwd,
-    );
+    const { tools, client, close } = await discoverStdioMcp({
+      name: serviceName,
+      command: svc.command,
+      args: svc.args || [],
+      env: svc.env || {},
+      cwd: svc.cwd,
+    });
     perServiceTools[serviceName] = tools;
     perServiceCallers[serviceName] = {
-      callTool: async (name, args) => client.callTool({ name, arguments: args ?? {} }),
-      close: () => client.close(),
+      callTool: (name, args) => client.callTool({ name, arguments: args ?? {} }),
+      close,
     };
   } else {
     console.error(`[boot] adapter "${svc.adapter}" not yet implemented (service: ${serviceName})`);
