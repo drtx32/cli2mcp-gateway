@@ -388,6 +388,13 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
   const base = baseCmd.replace(/^.*\//, "").replace(/[^A-Za-z0-9_-]/g, "_");
   const captureHelpFn = options.captureHelpFn || captureHelp;
   const dualToolMode = options.dualToolMode === true;
+  // When true, only run --help on the top-level CLI and emit one tool per
+  // top-level subcommand. Skip the recursive walk into sub-subcommands. Use
+  // this for CLIs whose deep help trees are too slow or produce empty
+  // schemas (e.g. typer/rich panels that group commands without per-arg
+  // detail). Tool calls still get the full <cli> <sub> <sub> argv, so
+  // execution works as long as the top-level schema isn't required.
+  const skipRecursive = options.skipRecursive === true;
   const topHelp = await captureHelpFn(baseCmd, []);
   const roots = dualToolMode
     ? []
@@ -458,6 +465,21 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
     if (!helpText.trim()) return;
     const subcommands = parseSubcommandNames(helpText);
     if (subcommands.length > 0) {
+      // If skipRecursive: emit a single tool for THIS command path that
+      // accepts any subcommand as args. Otherwise recurse into each sub.
+      if (skipRecursive) {
+        const shape = parseSubcommandSchema(helpText, commandPath);
+        const firstLine = helpText.split(/\r?\n/).find(l => l.trim() && !l.startsWith("usage:"))
+          || `${baseCmd} ${commandPath.join(" ")}`;
+        out.push({
+          name: toolNameForPath(base, commandPath),
+          description: firstLine.trim()
+            + ` (skips sub-subcommand discovery; pass any deeper subcommand as args)`,
+          inputSchema: toInputSchema(shape),
+          dispatch: { commandPath, shape },
+        });
+        return;
+      }
       for (const sub of subcommands) {
         await walk([...commandPath, sub]);
       }
@@ -485,6 +507,22 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
       inputSchema: toInputSchema(shape),
       dispatch: { commandPath: [], shape },
     });
+    return out;
+  }
+
+  if (skipRecursive) {
+    // Fast path: only one --help call (already done) at the top level. Emit
+    // one tool per top-level subcommand. No sub-args discovery.
+    const subcommands = parseSubcommandNames(topHelp);
+    for (const sub of subcommands) {
+      const toolName = toolNameForPath(base, [sub]);
+      out.push({
+        name: toolName,
+        description: `${sub} (top-level subcommand of ${baseCmd})`,
+        inputSchema: { type: "object", properties: { args: { type: "array", items: { type: "string" } } } },
+        dispatch: { commandPath: [sub], shape: { positionals: [], flags: [] } },
+      });
+    }
     return out;
   }
 

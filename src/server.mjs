@@ -29,6 +29,10 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { execa } from "execa";
 import { discoverTools, buildArgv } from "./help-parser.js";
+import { loadBoxConfig, legacyEnvConfig, configSummary } from "./box-config.mjs";
+import { aggregateTools, buildDispatchTable, resolveToolCall } from "./tool-aggregator.mjs";
+import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -90,6 +94,39 @@ if (!env.OAUTH_ISSUER) {
 }
 
 // Token: 优先级 MCP_TOKEN > AUTH_MODE=oauth 时空 > 随机
+// Override env values with box config (only for fields box config actually
+// owns). This keeps the rest of the file reading `env.PORT` / `env.HOST`
+// etc. without having to thread box.config through every middleware.
+// Anything not in box config keeps reading from env (legacy mode).
+//
+// NOTE: this runs only when actually serving (not for `config check/list`
+// subcommands which exit earlier). It must come AFTER `let box = ...`.
+function applyBoxConfigToEnv(box) {
+  if (box.config.transport?.type && box.config.transport.type !== "stdio") {
+    env.PORT = box.config.transport.port;
+    env.HOST = box.config.transport.host || "127.0.0.1";
+  }
+  if (box.config.auth) {
+    if (box.config.auth.mode) env.AUTH_MODE = box.config.auth.mode;
+    if (box.config.auth.token) env.MCP_TOKEN = box.config.auth.token;
+  }
+  if (box.config.rate_limit) {
+    env.RATE_LIMIT_RPS = box.config.rate_limit.rps ?? env.RATE_LIMIT_RPS;
+    env.RATE_LIMIT_BURST = box.config.rate_limit.burst ?? env.RATE_LIMIT_BURST;
+  }
+  if (box.config.cors) {
+    env.CORS_ORIGINS = (box.config.cors.origins || []);
+  }
+  if (box.config.ip_allowlist && box.config.ip_allowlist.length > 0) {
+    // Map ip_allowlist onto the legacy ALLOWED_IPS so the existing middleware
+    // continues to work without changes.
+    env.ALLOWED_IPS = box.config.ip_allowlist;
+  }
+  if (box.config.health?.path) {
+    env.HEALTH_PATH = box.config.health.path;
+  }
+}
+
 env.TOKEN = env.MCP_TOKEN
   || (env.AUTH_MODE === "oauth" ? "" : randomBytes(24).toString("base64url"));
 
@@ -139,7 +176,58 @@ Env:
   STDIO_IDLE_TIMEOUT_SEC  stdio path idle exit
   STDIO_BOOT_TIMEOUT_SEC  stdio path boot deadline
 `);
+
+  // yaml config-mode help (printed when --config flag is referenced but no subcommand).
+  console.log(`
+Config file mode:
+  node src/server.mjs serve --config /path/to/box.yaml [--http|--stdio] [--env-dir DIR]
+
+  --config PATH    load a multi-service box from a YAML file (recommended)
+  --env-dir DIR    base dir for relative env_file paths (default: dir of --config)
+  --http | --stdio transport (default: from config; falls back to stdio)
+
+  node src/server.mjs config check --config /path/to/box.yaml    validate + summarize
+  node src/server.mjs config list  --config /path/to/box.yaml    print merged services
+
+The legacy single-CLI mode (CLI_COMMAND / CLI_CWD / CLI_SUBCOMMANDS env)
+remains supported when --config is omitted.
+`);
   process.exit(0);
+}
+
+if (subcmd === "config") {
+  // Subcommand: config check / config list. Always exits; never starts a server.
+  const subsub = argv[1];
+  const configFlagIdx = argv.indexOf("--config");
+  if (configFlagIdx === -1 || !argv[configFlagIdx + 1]) {
+    console.error("config subcommand requires --config <path>");
+    process.exit(1);
+  }
+  const configPath = argv[configFlagIdx + 1];
+  let box;
+  try {
+    box = loadBoxConfig(configPath, { envDir: argv[argv.indexOf("--env-dir") + 1] || undefined });
+  } catch (err) {
+    console.error(String(err.message || err));
+    process.exit(2);
+  }
+  if (subsub === "check") {
+    console.log(`ok: ${Object.keys(box.config.services).length} services, ${box.config.transport.type} transport`);
+    console.log(configSummary(box));
+    process.exit(0);
+  }
+  if (subsub === "list") {
+    for (const [name, svc] of Object.entries(box.config.services)) {
+      console.log(`service: ${name}`);
+      console.log(`  adapter:  ${svc.adapter}`);
+      if (svc.adapter === "cli") console.log(`  command:  ${svc.command}`);
+      if (svc.adapter === "mcp-http") console.log(`  url:      ${svc.url}`);
+      if (svc.adapter === "openapi") console.log(`  base_url: ${svc.base_url}`);
+    }
+    process.exit(0);
+  }
+  console.error(`unknown config subcommand: ${subsub}`);
+  process.exit(1);
 }
 
 if (subcmd !== "serve") {
@@ -147,43 +235,137 @@ if (subcmd !== "serve") {
   process.exit(1);
 }
 
-const wantHttp = argv.includes("--http");
-const wantStdio = argv.includes("--stdio") || (!wantHttp);
+// ---- --config / legacy branch ----
+// If --config is given, load multi-service box config. Otherwise derive
+// a single-service box from legacy env vars (CLI_COMMAND / CLI_CWD / ...).
+const argvSet = new Set(argv);
+let box;
+{
+  const configFlagIdx = argv.indexOf("--config");
+  if (configFlagIdx !== -1) {
+    const configPath = argv[configFlagIdx + 1];
+    if (!configPath) {
+      console.error("--config requires a path argument");
+      process.exit(1);
+    }
+    const envDirIdx = argv.indexOf("--env-dir");
+    box = loadBoxConfig(configPath, {
+      envDir: envDirIdx !== -1 ? argv[envDirIdx + 1] : undefined,
+    });
+  } else {
+    box = { path: null, config: legacyEnvConfig() };
+  }
+}
+
+const wantHttp = argv.includes("--http") || box.config.transport.type === "http" || box.config.transport.type === "sse";
+const wantStdio = argv.includes("--stdio") || box.config.transport.type === "stdio";
 // 不允许同时开两种 transport
-if (wantHttp && wantStdio && argv.includes("--stdio") && argv.includes("--http")) {
+if (argv.includes("--http") && argv.includes("--stdio")) {
   console.error("Cannot use both --http and --stdio at the same time");
   process.exit(1);
 }
 
-// ===== 3. 共用层:downstream CLI 直接 spawn + createServer 工厂 =====
+// Apply box config to env (HTTP transport / auth / rate / cors / ip / health).
+// We do this here (just after `let box = ...` and the transport validation)
+// so the legacy env-only paths below keep reading from env while the new
+// config-file path gets the configured values.
+applyBoxConfigToEnv(box);
+
+// ===== 3. 共用层:多 service 工具发现 + 聚合 =====
 //
-// Discover tools by running `<cli> --help` and `<cli> <sub> --help` for each
-// subcommand. One MCP tool per (sub)command. The gateway spawns the CLI
-// directly via execa — no nested MCP client.
+// For each service in the box config, run the adapter's discover() to
+// collect its tools. We then merge them under a single namespace (see
+// tool-aggregator.mjs). One MCP tool per leaf across all services.
 //
 // STDIO_BOOT_TIMEOUT_SEC only applies to the initial discovery phase
 // (default: 0 = wait forever; we don't want to crash-loop the gateway if
-// the CLI is slow to print --help).
+// a service is slow to print --help).
 
 env.STDIO_BOOT_TIMEOUT_SEC = env.STDIO_BOOT_TIMEOUT_SEC ?? 0;
 
 let bootTimeoutHandle = null;
 if (env.STDIO_BOOT_TIMEOUT_SEC > 0) {
   bootTimeoutHandle = setTimeout(() => {
-    console.error(`[boot] downstream CLI discovery exceeded ${env.STDIO_BOOT_TIMEOUT_SEC}s — exiting non-zero`);
+    console.error(`[boot] service discovery exceeded ${env.STDIO_BOOT_TIMEOUT_SEC}s — exiting non-zero`);
     process.exit(2);
   }, env.STDIO_BOOT_TIMEOUT_SEC * 1000);
 }
 
-const tools = await discoverTools(
-  env.CLI_COMMAND,
-  env.CLI_SUBCOMMANDS.length > 0 ? env.CLI_SUBCOMMANDS : null,
-  { dualToolMode: env.CLI_DUAL_TOOL_MODE },
-);
+/** @type {Record<string, Array<{name: string, description: string, inputSchema: object, dispatch?: object}>>} */
+const perServiceTools = {};
+/** @type {Record<string, { callTool: (name: string, args: any) => Promise<any>, close: () => Promise<void> }>} */
+const perServiceCallers = {};
+
+async function discoverStdioMcpTools(serviceName, command, args, env, cwd) {
+  const transport = new StdioClientTransport({
+    command,
+    args: args || [],
+    env: { ...process.env, ...(env || {}) },
+    cwd: cwd || process.cwd(),
+    stderr: "inherit",  // forward to our stderr; prevents pipe-buffer deadlock
+  });
+  const client = new McpClient(
+    { name: `cli2mcp-gateway-bridge/${serviceName}`, version: "1.0.0" },
+    { capabilities: {} },
+  );
+  await client.connect(transport);
+  const { tools } = await client.listTools();
+  // Map MCP tool format into the aggregator-friendly format. Dispatch goes
+  // through `perServiceCallers[serviceName].callTool`.
+  return { client, tools: tools.map(t => ({
+    name: t.name,
+    description: t.description ?? "",
+    inputSchema: t.inputSchema ?? { type: "object", properties: {} },
+  })) };
+}
+
+for (const [serviceName, svc] of Object.entries(box.config.services)) {
+  console.error(`[boot] discovering service: ${serviceName} (adapter=${svc.adapter})`);
+  if (svc.adapter === "cli") {
+    const subcmds = svc.subcommands && svc.subcommands.length > 0 ? svc.subcommands : null;
+    // dual_tool_mode can be set on the service directly (preferred) or via
+    // the legacy env-var path (which synthesises a single-service box).
+    let dualMode = false;
+    let skipRec = false;
+    if (typeof svc.dual_tool_mode === "boolean") {
+      dualMode = svc.dual_tool_mode;
+    } else if (svc.__legacy && typeof svc.__legacy.CLI_DUAL_TOOL_MODE === "boolean") {
+      dualMode = svc.__legacy.CLI_DUAL_TOOL_MODE;
+    }
+    if (typeof svc.skip_recursive === "boolean") {
+      skipRec = svc.skip_recursive;
+    }
+    perServiceTools[serviceName] = await discoverTools(
+      svc.command,
+      subcmds,
+      { dualToolMode: dualMode, skipRecursive: skipRec, cwd: svc.cwd },
+    );
+  } else if (svc.adapter === "mcp-stdio") {
+    const { client, tools } = await discoverStdioMcpTools(
+      serviceName,
+      svc.command,
+      svc.args || [],
+      svc.env || {},
+      svc.cwd,
+    );
+    perServiceTools[serviceName] = tools;
+    perServiceCallers[serviceName] = {
+      callTool: async (name, args) => client.callTool({ name, arguments: args ?? {} }),
+      close: () => client.close(),
+    };
+  } else {
+    console.error(`[boot] adapter "${svc.adapter}" not yet implemented (service: ${serviceName})`);
+    process.exit(1);
+  }
+}
 if (bootTimeoutHandle) clearTimeout(bootTimeoutHandle);
 
+const aggTools = aggregateTools(perServiceTools, box.config.naming);
+const toolDispatch = buildDispatchTable(aggTools);
+const tools = aggTools;
+
 if (tools.length === 0) {
-  console.error(`[boot] no tools discovered for "${env.CLI_COMMAND}". Does it support --help?`);
+  console.error(`[boot] no tools discovered across ${Object.keys(box.config.services).length} service(s). Does each CLI support --help?`);
   process.exit(1);
 }
 const allowedTools = new Set(tools.map((tool) => tool.name));
@@ -203,10 +385,45 @@ function createServer() {
     const tool = toolByName.get(name);
     if (!tool) throw new Error(`Tool not allowlisted: ${name}`);
 
+    // Look up the owning service from the dispatch table so per-call
+    // dispatch (CLI command, cwd, timeout, env) comes from box config.
+    const dispatch = toolDispatch.get(name);
+    if (!dispatch) throw new Error(`Tool dispatch missing: ${name}`);
+    const svc = box.config.services[dispatch.serviceName];
+    if (!svc) throw new Error(`Service not found for tool ${name}: ${dispatch.serviceName}`);
+    const serviceCwd = svc.cwd || env.CLI_CWD;
+    const serviceTimeout = svc.timeout_ms || env.CLI_TIMEOUT_MS;
+    const serviceMaxBytes = svc.max_output_bytes || env.CLI_MAX_OUTPUT_BYTES;
+    const serviceEnv = { ...process.env, ...(svc.env || {}) };
+
+    // mcp-stdio adapter: forward the call through the per-service MCP client
+    // we set up at boot. No subprocess spawn here — the stdio MCP server is
+    // already running, we just round-trip the JSON-RPC.
+    if (svc.adapter === "mcp-stdio") {
+      const caller = perServiceCallers[dispatch.serviceName];
+      if (!caller) {
+        throw new Error(`MCP client missing for service ${dispatch.serviceName}`);
+      }
+      const result = await caller.callTool(tool.originalName, callArgs);
+      // Apply the same output-byte cap as for CLI tools so a runaway upstream
+      // can't blow up our response size.
+      let text = (result.content || [])
+        .map(c => c.type === "text" ? c.text : `[${c.type}]`)
+        .join("\n");
+      if (text.length > serviceMaxBytes) {
+        const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
+        text = text.slice(0, serviceMaxBytes) + hint;
+      }
+      return {
+        content: [{ type: "text", text }],
+        isError: Boolean(result.isError),
+      };
+    }
+
     // Synthetic "help" tool: run `<cli> [sub] --help [extra args]` and return
     // raw text. This is the agent's primary way to discover what's available
     // without burning output budget on broad enumeration tools.
-    if (tool.dispatch.kind === "help") {
+    if (tool.dispatch && tool.dispatch.kind === "help") {
       const argv = [];
       const commandPath = Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0
         ? callArgs.commandPath
@@ -214,20 +431,18 @@ function createServer() {
       if (commandPath.length > 0) argv.push(...commandPath);
       argv.push("--help");
       if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
-      const r = await execa(env.CLI_COMMAND, argv, {
-        cwd: env.CLI_CWD,
-        timeout: env.CLI_TIMEOUT_MS,
+      const r = await execa(svc.command, argv, {
+        cwd: serviceCwd,
+        timeout: serviceTimeout,
         reject: false,
-        env: process.env,
+        env: serviceEnv,
       });
-      // help tool returns full text (no truncation) — its whole purpose is to
-      // reveal schema without budget concerns.
       const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
       const text = (r.stdout || r.stderr || "").trim()
-        || `(${env.CLI_COMMAND}${commandPathText} --help produced no output)`;
-      const target = `${env.CLI_COMMAND}${commandPathText} --help`;
+        || `(${svc.command}${commandPathText} --help produced no output)`;
+      const target = `${svc.command}${commandPathText} --help`;
       const header = [
-        `Help for ${env.CLI_COMMAND}${commandPathText}.`,
+        `Help for ${svc.command}${commandPathText}.`,
         `Use this meta-tool to inspect the CLI, or pass "commandPath" (preferred) or "sub" plus "args" to drill down into a command help page.`,
         `Raw output from ${target}:`,
       ].join("\n");
@@ -237,16 +452,16 @@ function createServer() {
     // Synthetic "run" tool (dual-tool mode): execute `<cli> <commandPath...> <args...>`
     // verbatim, no --help appended. Lets the agent reach nested subcommands that
     // per-tool schema inference can't represent.
-    if (tool.dispatch.kind === "run") {
+    if (tool.dispatch && tool.dispatch.kind === "run") {
       const argv = [];
       const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
       if (commandPath.length > 0) argv.push(...commandPath);
       if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
-      const r = await execa(env.CLI_COMMAND, argv, {
-        cwd: env.CLI_CWD,
-        timeout: env.CLI_TIMEOUT_MS,
+      const r = await execa(svc.command, argv, {
+        cwd: serviceCwd,
+        timeout: serviceTimeout,
         reject: false,
-        env: process.env,
+        env: serviceEnv,
         input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
       });
       if (r.exitCode !== 0) {
@@ -257,10 +472,9 @@ function createServer() {
         };
       }
       let text = r.stdout || "";
-      const maxBytes = env.CLI_MAX_OUTPUT_BYTES;
-      if (text.length > maxBytes) {
-        const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${maxBytes} shown. Re-run with a narrower scope to get a smaller result.]`;
-        text = text.slice(0, maxBytes) + hint;
+      if (text.length > serviceMaxBytes) {
+        const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown. Re-run with a narrower scope to get a smaller result.]`;
+        text = text.slice(0, serviceMaxBytes) + hint;
       }
       return { content: [{ type: "text", text }] };
     }
@@ -271,11 +485,11 @@ function createServer() {
       : (tool.dispatch.subcommand ? [tool.dispatch.subcommand] : []);
     if (commandPath.length > 0) argv.push(...commandPath);
     argv.push(...buildArgv(tool.dispatch.shape, callArgs));
-    const r = await execa(env.CLI_COMMAND, argv, {
-        cwd: env.CLI_CWD,
-        timeout: env.CLI_TIMEOUT_MS,
+    const r = await execa(svc.command, argv, {
+        cwd: serviceCwd,
+        timeout: serviceTimeout,
         reject: false,
-        env: process.env,
+        env: serviceEnv,
         input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
       }
     );
@@ -290,10 +504,9 @@ function createServer() {
     // Truncate very large stdout. Help tool already short-circuited above and
     // is exempt; every other tool gets the same budget.
     let text = r.stdout || "";
-    const maxBytes = env.CLI_MAX_OUTPUT_BYTES;
-    if (text.length > maxBytes) {
-      const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${maxBytes} shown. Re-run with a narrower scope — e.g. pass a specific subcommand to the help tool, or target a single item — to get a smaller result.]`;
-      text = text.slice(0, maxBytes) + hint;
+    if (text.length > serviceMaxBytes) {
+      const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown. Re-run with a narrower scope — e.g. pass a specific subcommand to the help tool, or target a single item — to get a smaller result.]`;
+      text = text.slice(0, serviceMaxBytes) + hint;
     }
     return { content: [{ type: "text", text }] };
   });
@@ -443,8 +656,9 @@ async function runHttp() {
 
   // Rate limit(per-IP token bucket,内存实现,不引外部依赖)
   const rateBuckets = new Map();
+  const healthPath = env.HEALTH_PATH || "/health";
   app.use((req, res, next) => {
-    if (req.path === "/health") return next();  // health 不限流
+    if (req.path === healthPath) return next();  // health 不限流
     const ip = req.ip || req.socket.remoteAddress || "unknown";
     const now = Date.now();
     let bucket = rateBuckets.get(ip);
@@ -598,7 +812,7 @@ async function runHttp() {
     healthBody.toolNames = [...allowedTools];
     healthBody.cliResolved = Boolean(env.CLI_COMMAND);
   }
-  app.get("/health", (_req, res) => res.json(healthBody));
+  app.get(healthPath, (_req, res) => res.json(healthBody));
 
   if (oauthNeeded) {
     app.get("/.well-known/oauth-protected-resource", (_req, res) => res.json({
