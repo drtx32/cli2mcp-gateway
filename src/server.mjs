@@ -256,6 +256,14 @@ let box;
   }
 }
 
+// Legacy mode: skip the aggregator. The aggregator would otherwise prefix
+// every tool name with the service name (e.g. `multica__multica_run`),
+// but the legacy single-CLI mode has always exposed tools with their raw
+// names (e.g. `multica_run`). Keeping the raw names preserves backward
+// compat for any existing client that depends on them. Box.yaml mode
+// explicitly opts into namespacing by configuring `naming.separator`.
+const usingLegacy = box.path === null;
+
 const wantHttp = argv.includes("--http") || box.config.transport.type === "http" || box.config.transport.type === "sse";
 const wantStdio = argv.includes("--stdio") || box.config.transport.type === "stdio";
 // 不允许同时开两种 transport
@@ -335,8 +343,12 @@ for (const [serviceName, svc] of Object.entries(box.config.services)) {
 }
 if (bootTimeoutHandle) clearTimeout(bootTimeoutHandle);
 
-const aggTools = aggregateTools(perServiceTools, box.config.naming);
-const toolDispatch = buildDispatchTable(aggTools);
+const aggTools = usingLegacy
+  ? Object.values(perServiceTools).flat()  // preserve raw tool names
+  : aggregateTools(perServiceTools, box.config.naming);
+const toolDispatch = usingLegacy
+  ? new Map(aggTools.map(t => [t.name, { serviceName: Object.keys(perServiceTools).find(k => perServiceTools[k].includes(t)), originalName: t.name }]))
+  : buildDispatchTable(aggTools);
 const tools = aggTools;
 
 if (tools.length === 0) {
