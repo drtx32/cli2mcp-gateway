@@ -188,6 +188,72 @@ All config flows through environment variables. See `.env.example` for the full 
 
 OAuth is required to be served over HTTPS in non-localhost deployments; the gateway refuses to start otherwise.
 
+## Multi-service `box.yaml` mode
+
+For multiple upstreams, use a `box.yaml` file. The gateway supports these
+inbound adapters:
+
+- `cli` — a non-MCP CLI. The gateway can expose `help + run`
+  (`dual_tool_mode: true`) or `help + recursively discovered leaf commands`
+  (the default).
+- `mcp-stdio` — an MCP server launched as a stdio child process. For a CLI
+  whose MCP entry point is a subcommand, put that subcommand in `args`, for
+  example `args: [mcp]`.
+- `mcp-http` — an upstream Streamable HTTP MCP server. Use `headers` for
+  bearer tokens or other gateway-to-gateway headers; `auth.token` can
+  generate an `Authorization: Bearer ...` header.
+- `auto` — probe the command as MCP stdio first (including a conventional
+  `mcp` subcommand), then fall back to the help-driven `cli` adapter.
+
+Example:
+
+```yaml
+name: my-box
+services:
+  local_cli:
+    adapter: cli
+    command: my-cli
+    dual_tool_mode: false
+  pure_mcp:
+    adapter: mcp-stdio
+    command: npx
+    args: [-y, my-mcp-server]
+  remote_mcp:
+    adapter: mcp-http
+    url: https://mcp.example.com/mcp
+    auth:
+      type: bearer
+      token: ${UPSTREAM_MCP_TOKEN}
+transport:
+  type: http
+  host: 127.0.0.1
+  port: 3100
+```
+
+### Local runtime management
+
+`serve` remains the foreground entrypoint. For Windows-friendly background
+management, register HTTP boxes with the local runtime daemon:
+
+```powershell
+cli2mcp-gateway create --name my-box --config .\box.yaml --start
+cli2mcp-gateway list
+cli2mcp-gateway get <id>
+cli2mcp-gateway logs <id> --tail 100
+cli2mcp-gateway restart <id>
+cli2mcp-gateway stop <id>
+cli2mcp-gateway start <id>
+cli2mcp-gateway update <id> --config .\box-v2.yaml
+cli2mcp-gateway rename <id> my-box-v2
+cli2mcp-gateway delete <id>
+```
+
+The daemon and managed gateway processes are detached from the terminal and
+use a per-user state directory (`%LOCALAPPDATA%\cli2mcp-gateway` on Windows,
+or `$XDG_STATE_HOME/cli2mcp-gateway` on other platforms). `get` includes the
+registered instance metadata and the current YAML text. Runtime management is
+intended for `http`/`sse` boxes; use `serve` directly for stdio mode.
+
 ---
 
 ## How a downstream tool call flows

@@ -12,6 +12,7 @@
 
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { buildServiceEnv } from "../service-env.mjs";
 
 /**
  * Discover the tool list of an upstream stdio MCP server.
@@ -31,7 +32,7 @@ export async function discoverStdioMcp(cfg) {
   const transport = new StdioClientTransport({
     command: cfg.command,
     args: cfg.args || [],
-    env: { ...process.env, ...(cfg.env || {}) },
+    env: buildServiceEnv(process.env, cfg.env || {}),
     cwd: cfg.cwd || process.cwd(),
     stderr: "inherit",  // forward to our stderr; avoids pipe-buffer deadlock
   });
@@ -51,4 +52,35 @@ export async function discoverStdioMcp(cfg) {
     client,
     close: () => client.close(),
   };
+}
+
+/**
+ * Best-effort detector for `adapter: auto`. A normal CLI that exits or emits
+ * non-MCP output is treated as a CLI; an MCP server that completes the
+ * initialize/listTools handshake is treated as mcp-stdio.
+ */
+export async function isStdioMcp(cfg, timeoutMs = 3_000) {
+  const transport = new StdioClientTransport({
+    command: cfg.command,
+    args: cfg.args || [],
+    env: buildServiceEnv(process.env, cfg.env || {}),
+    cwd: cfg.cwd || process.cwd(),
+    stderr: "inherit",
+  });
+  const client = new McpClient(
+    { name: `cli2mcp-gateway-probe/${cfg.name}`, version: "1.0.0" },
+    { capabilities: {} },
+  );
+  const timeout = new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new Error("MCP stdio probe timed out")), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    await Promise.race([client.connect(transport).then(() => client.listTools()), timeout]);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await transport.close().catch(() => {});
+  }
 }

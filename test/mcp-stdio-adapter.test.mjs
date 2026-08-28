@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
-import { discoverStdioMcp } from "../src/adapters/mcp-stdio.mjs";
+import { discoverStdioMcp, isStdioMcp } from "../src/adapters/mcp-stdio.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const stubPath = resolve(__dirname, "..", "test-fixtures", "stub-mcp-server.mjs");
@@ -62,4 +62,20 @@ test("mcp-stdio adapter: closes cleanly without hanging the process", async () =
   // close() should resolve; if the child process hangs, this test will time
   // out via node:test's default 30s timeout.
   await close();
+});
+
+test("mcp-stdio adapter: auto probe recognises an MCP server", async () => {
+  assert.equal(await isStdioMcp({
+    name: "probe",
+    command: process.execPath,
+    args: [stubPath],
+  }), true);
+});
+
+test("mcp-stdio adapter: auto probe rejects a normal CLI", async () => {
+  assert.equal(await isStdioMcp({
+    name: "probe",
+    command: process.execPath,
+    args: ["--help"],
+  }, 1000), false);
 });

@@ -121,6 +121,18 @@ const ServiceBase = z.object({
 });
 
 const ServiceSchema = z.discriminatedUnion("adapter", [
+  // ---- auto adapter ----
+  // Probe a command as MCP stdio first, including a conventional `mcp`
+  // subcommand, and fall back to the help-driven CLI adapter.
+  ServiceBase.extend({
+    adapter: z.literal("auto"),
+    command: z.string(),
+    args: z.array(z.string()).optional().default([]),
+    cwd: z.string().optional(),
+    subcommands: z.array(z.string()).optional(),
+    dual_tool_mode: z.boolean().optional().default(false),
+    skip_recursive: z.boolean().optional().default(false),
+  }),
   // ---- cli adapter (current capability) ----
   ServiceBase.extend({
     adapter: z.literal("cli"),
@@ -147,11 +159,15 @@ const ServiceSchema = z.discriminatedUnion("adapter", [
     args: z.array(z.string()).optional().default([]),
     cwd: z.string().optional(),
   }),
-  // ---- mcp-http adapter (Phase 5) ----
+  // ---- mcp-http adapter ----
   ServiceBase.extend({
     adapter: z.literal("mcp-http"),
     url: z.string().url(),
     headers: z.record(z.string(), z.string()).optional().default({}),
+    auth: z.object({
+      type: z.enum(["headers", "bearer", "oauth"]).optional().default("headers"),
+      token: z.string().optional(),
+    }).optional().default({}),
   }),
   // ---- openapi adapter (Phase 5) ----
   ServiceBase.extend({
