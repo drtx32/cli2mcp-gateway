@@ -55,6 +55,27 @@ async function waitForHealth(config, timeoutMs = 15_000) {
   throw new Error("timed out waiting for gateway health: " + url);
 }
 
+async function waitForGatewayReady(config, child, timeoutMs = 15_000) {
+  let cleanup = () => {};
+  const childFailure = new Promise((_, reject) => {
+    const onError = error => reject(new Error("gateway process failed: " + error.message));
+    const onExit = (code, signal) => reject(new Error(
+      `gateway process exited before health check (code=${code ?? "null"}, signal=${signal ?? "none"})`,
+    ));
+    child.once("error", onError);
+    child.once("exit", onExit);
+    cleanup = () => {
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+  });
+  try {
+    return await Promise.race([waitForHealth(config, timeoutMs), childFailure]);
+  } finally {
+    cleanup();
+  }
+}
+
 async function killPid(pid) {
   if (!isAlive(pid)) return;
   if (process.platform === "win32") {
@@ -125,12 +146,12 @@ export async function startInstance(id) {
   children.set(id, child);
   updateInstance(id, { status: "starting", pid: child.pid, endpoint });
   try {
-    await waitForHealth(config);
+    await waitForGatewayReady(config, child);
     return updateInstance(id, { status: "running", pid: child.pid, endpoint });
   } catch (error) {
     await killPid(child.pid);
     children.delete(id);
-    updateInstance(id, { status: "failed", pid: null, endpoint });
+    updateInstance(id, { status: "failed", pid: null, endpoint, error: error.message });
     throw error;
   }
 }
