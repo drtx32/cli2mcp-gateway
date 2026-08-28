@@ -433,7 +433,7 @@ function createServer() {
     // mcp-stdio adapter: forward the call through the per-service MCP client
     // we set up at boot. No subprocess spawn here — the stdio MCP server is
     // already running, we just round-trip the JSON-RPC.
-    if (svc.adapter === "mcp-stdio") {
+    if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
       const caller = perServiceCallers[dispatch.serviceName];
       if (!caller) {
         throw new Error(`MCP client missing for service ${dispatch.serviceName}`);

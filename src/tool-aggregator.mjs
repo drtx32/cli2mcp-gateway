@@ -43,6 +43,19 @@ export function aggregateTools(catalogs, opts = {}) {
   const separator = opts.separator ?? "__";
   const boxPrefix = opts.prefix ?? "";
   const policy = opts.collision_policy ?? "prefix_upstream";
+  // Opt-in: when a box has exactly one service, skip the per-service
+  // prefix. This keeps single-service deployments (e.g. a standalone
+  // multica MCP exposed on its own port) from renaming `multica_run` into
+  // `multica__multica_run` and breaking clients that were wired against the
+  // legacy raw-name shape. Multi-service boxes still prefix by default —
+  // collision policy handles any genuine name clash. Set `auto_unwrap_single_service:
+  // false` to force prefix even for single-service boxes.
+  const unwrapSingle = opts.auto_unwrap_single_service === true
+    && Object.keys(catalogs).length === 1;
+  // When unwrapping, just pass the raw name through — no separator, no
+  // service prefix. Otherwise behave as before.
+  const effectiveBoxPrefix = unwrapSingle ? "" : boxPrefix;
+  const effectivePolicy = unwrapSingle ? "error" : policy;
 
   /** @type {AggregatedTool[]} */
   const out = [];
@@ -55,13 +68,15 @@ export function aggregateTools(catalogs, opts = {}) {
       // is unique per (serviceName, originalName) by construction; with
       // suffix_upstream it is too; with `separator: ""` and matching original
       // names, two services collide — error policy must catch that.
-      const qualified = (policy === "suffix_upstream")
-        ? `${boxPrefix}${t.name}${separator}${serviceName}`
-        : `${boxPrefix}${serviceName}${separator}${t.name}`;
+      const qualified = unwrapSingle
+        ? t.name
+        : (effectivePolicy === "suffix_upstream")
+          ? `${effectiveBoxPrefix}${t.name}${separator}${serviceName}`
+          : `${effectiveBoxPrefix}${serviceName}${separator}${t.name}`;
 
       // collision_policy=error: refuse to start if this qualified name was
       // already produced by a different (or same) upstream.
-      if (policy === "error" && byName.has(qualified)) {
+      if (effectivePolicy === "error" && byName.has(qualified)) {
         throw new Error(
           `tool-aggregator: namespace collision on "${qualified}" ` +
           `between service "${byName.get(qualified).serviceName}" ` +

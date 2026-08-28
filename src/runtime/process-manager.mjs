@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { closeSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { promisify } from "node:util";
+import { isAbsolute } from "node:path";
 
 import { loadBoxConfig } from "../box-config.mjs";
 import {
@@ -16,6 +17,54 @@ import { getInstance, listInstances, updateInstance } from "./registry.mjs";
 const execFileAsync = promisify(execFile);
 const serverEntry = resolve(dirname(fileURLToPath(import.meta.url)), "..", "server.mjs");
 const children = new Map();
+
+// Parse a dotenv-style file into a flat {KEY: VALUE} object. Lines starting
+// with # and blank lines are ignored. Values are taken verbatim (no $VAR
+// expansion, no escape handling) — env_file is for static config, not
+// templating. The result is sufficient for env_file: at the service / auth /
+// transport level in box.yaml.
+function parseEnvFile(path) {
+  const result = {};
+  if (!existsSync(path)) return result;
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    if (!line || line.startsWith("#")) continue;
+    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+    if (m) result[m[1]] = m[2];
+  }
+  return result;
+}
+
+// Walk a box.yaml (via loadBoxConfig) and merge every referenced env_file's
+// contents into a flat env map. The same file may be referenced by multiple
+// service/auth/transport sections — later refs overwrite earlier ones, which
+// matches the legacy PM2 ecosystem behaviour of applying the file's keys
+// after the previous env.
+function collectEnvFromBoxConfig(configPath) {
+  const env = {};
+  let box;
+  try {
+    box = loadBoxConfig(configPath);
+  } catch (error) {
+    return env;
+  }
+  const baseDir = dirname(configPath);
+  const resolvePath = (p) => isAbsolute(p) ? p : resolve(baseDir, p);
+  const merge = (entries) => {
+    const files = Array.isArray(entries) ? entries : (entries ? [entries] : []);
+    for (const entry of files) {
+      const spec = (typeof entry === "string")
+        ? { path: entry, required: false }
+        : entry;
+      const path = resolvePath(spec.path);
+      Object.assign(env, parseEnvFile(path));
+    }
+  };
+  for (const svc of Object.values(box.config.services ?? {})) {
+    merge(svc.env_file);
+  }
+  merge(box.config.auth?.env_file);
+  return env;
+}
 
 function endpointForConfig(config) {
   const transport = config.transport;
@@ -122,6 +171,13 @@ export async function startInstance(id) {
   const stdout = openSync(instanceStdoutFile(id), "a");
   const stderr = openSync(instanceStderrFile(id), "a");
   const { spawn } = await import("node:child_process");
+  // Load every env_file referenced by this instance's box.yaml (services +
+  // auth). Without this, box.yaml's env_file values (MCP_TOKEN,
+  // ALLOWED_HOSTS, CLI_*, etc.) never reach the child gateway's process.env,
+  // so server.mjs's process.env.* fallbacks fail. The collected env sits
+  // on top of the daemon's own process.env so the runtime can keep
+  // CLI2MCP_RUNTIME_* and the explicit GANG_* exports for ${VAR} expansion.
+  const fileEnv = collectEnvFromBoxConfig(instance.configPath);
   const child = spawn(
     process.execPath,
     [serverEntry, "serve", "--config", instance.configPath, "--http"],
@@ -131,7 +187,8 @@ export async function startInstance(id) {
       windowsHide: true,
       stdio: ["ignore", stdout, stderr],
       env: {
-        ...process.env,
+        ...fileEnv,
+        ...process.env,  // daemon's exports (GANG_*, CLI2MCP_RUNTIME_*) win over file values
         CLI2MCP_RUNTIME_INSTANCE_ID: id,
         CLI2MCP_RUNTIME_INSTANCE_NAME: instance.name,
       },

@@ -189,6 +189,12 @@ const NamingSchema = z.object({
   prefix: z.string().optional().default(""),
   collision_policy: z.enum(["prefix_upstream", "suffix_upstream", "error"]).optional()
     .default("prefix_upstream"),
+  // Opt-in: when a box has exactly one service, skip per-service prefixing.
+  // This keeps single-service deployments from accidentally renaming
+  // `multica_run` → `multica__multica_run` and breaking clients wired
+  // against the legacy raw-name shape. Off by default to preserve the
+  // pre-feature behaviour; turn on for single-service boxes.
+  auto_unwrap_single_service: z.boolean().optional().default(false),
 }).optional().default({});
 
 const BoxSchema = z.object({
@@ -197,6 +203,15 @@ const BoxSchema = z.object({
 
   services: z.record(z.string().regex(/^[a-z][a-z0-9_-]*$/), ServiceSchema)
     .refine(svc => Object.keys(svc).length >= 1, { message: "at least one service required" }),
+
+  // Top-level env (docker-compose style). `env` and `env_file` here feed the
+  // ${VAR} expansion context for the whole box (used by service.headers,
+  // service.url, etc.). They do NOT become the spawn env directly — that's
+  // still driven by per-service env_file / env. Order in the expansion
+  // context is: env_file (last write wins) → env (overrides file) →
+  // process.env (fallback only).
+  env: z.record(z.string(), z.string()).optional(),
+  env_file: z.union([EnvFileEntry, z.array(EnvFileEntry)]).optional(),
 
   naming: NamingSchema,
 
@@ -322,9 +337,16 @@ export function loadBoxConfig(configPath, opts = {}) {
     throw new Error(`box-config: ${configPath} did not parse to an object`);
   }
 
-  // 2. Expand ${VAR} using current process env. This must happen BEFORE
-  // env_file overlays, so that an env_file path can itself contain a ${VAR}.
-  const expandCtx = { ...process.env };
+  // 2. Build the ${VAR} expansion context. Docker-compose style:
+  //    - top-level `env_file`  → KEY=VALUE pairs loaded from file(s)
+  //    - top-level `env`       → inline KEY: VALUE (supports ${VAR} too)
+  //    - process.env           → fallback for any VAR not declared above
+  // Order matters: env_file first so env can override file values, then
+  // process.env as a final fallback. Anything declared in the box overrides
+  // what the runtime shell happened to inherit — explicit > implicit.
+  const fileCtx = resolveEnvFiles(parsed.env_file, basePath);
+  const inlineCtx = parsed.env && typeof parsed.env === "object" ? parsed.env : {};
+  const expandCtx = { ...process.env, ...fileCtx, ...inlineCtx };
   const expanded = expandDeep(parsed, expandCtx);
 
   // 3. Resolve env_file at every level (service, auth, transport).
