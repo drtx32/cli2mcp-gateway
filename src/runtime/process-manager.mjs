@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { isAbsolute } from "node:path";
 
 import { loadBoxConfig } from "../box-config.mjs";
+import yaml from "yaml";
 import {
   ensureRuntimeDirs,
   instanceDir,
@@ -34,16 +35,24 @@ function parseEnvFile(path) {
   return result;
 }
 
-// Walk a box.yaml (via loadBoxConfig) and merge every referenced env_file's
-// contents into a flat env map. The same file may be referenced by multiple
-// service/auth/transport sections — later refs overwrite earlier ones, which
-// matches the legacy PM2 ecosystem behaviour of applying the file's keys
-// after the previous env.
-function collectEnvFromBoxConfig(configPath) {
+// Walk a box.yaml and merge every referenced env_file's contents into a flat
+// env map. env_file may appear at three levels:
+//   - top-level (docker-compose style: env_file: /etc/foo.env)
+//   - per-service (services.<name>.env_file)
+//   - auth (auth.env_file — bearer token source)
+// The same file may be referenced by multiple sections — later refs overwrite
+// earlier ones, which matches the legacy PM2 ecosystem behaviour of applying
+// the file's keys after the previous env.
+//
+// We parse the raw YAML here (not loadBoxConfig's collapsed result) because
+// schema validation drops env_file from auth, and box-config collapses
+// services.*.env_file into services.*.env — neither preserves the original
+// env_file references we need to walk.
+export function collectEnvFromBoxConfig(configPath) {
   const env = {};
   let box;
   try {
-    box = loadBoxConfig(configPath);
+    box = yaml.parse(readFileSync(configPath, "utf8")) ?? {};
   } catch (error) {
     return env;
   }
@@ -52,17 +61,20 @@ function collectEnvFromBoxConfig(configPath) {
   const merge = (entries) => {
     const files = Array.isArray(entries) ? entries : (entries ? [entries] : []);
     for (const entry of files) {
-      const spec = (typeof entry === "string")
-        ? { path: entry, required: false }
-        : entry;
-      const path = resolvePath(spec.path);
-      Object.assign(env, parseEnvFile(path));
+      // Match loadBoxConfig's env_file entry shape: string shorthand or
+      // {path, required, format} object. We only honour string entries here —
+      // object form is rare and loadBoxConfig itself handles it later.
+      if (typeof entry !== "string") continue;
+      Object.assign(env, parseEnvFile(resolvePath(entry)));
     }
   };
-  for (const svc of Object.values(box.config.services ?? {})) {
-    merge(svc.env_file);
+  // docker-compose style: top-level env_file feeds both ${VAR} expansion
+  // (handled by box-config) AND child spawn env (handled here).
+  merge(box.env_file);
+  for (const svc of Object.values(box.services ?? {})) {
+    if (svc && typeof svc === "object") merge(svc.env_file);
   }
-  merge(box.config.auth?.env_file);
+  if (box.auth && typeof box.auth === "object") merge(box.auth.env_file);
   return env;
 }
 
