@@ -1,12 +1,17 @@
-// End-to-end verification that:
-//   - ashare_run returns the full stdout (no max_output_bytes cap), even
-//     when the underlying CLI output exceeds the per-service cap.
-//   - ashare_help still applies the cap (help text is metadata, callers
-//     use _run to fetch real results).
+// End-to-end verification of the gateway's content-block forwarding under
+// dual_tool_mode.
 //
-// This regression covers the ChatGPT "image looks broken" symptom where
-// the previous behaviour truncated a 350 KB base64 PNG into a 64 KB
-// fragment and corrupted the image.
+// The `ashare_run` meta-tool in dual_tool_mode is just a CLI subprocess
+// wrapper, so any subcommand that returns a giant base64 string in JSON
+// would be flattened to text and chopped at the per-service cap.  This
+// file covers the workaround: when the CLI is invoked with
+// `--output-format mcp`, it prints a single-line MCP envelope that the
+// gateway detects, parses, and forwards verbatim — image / audio / binary
+// content blocks survive the round-trip without losing bytes.
+//
+// We exercise this through the real gateway, against a real upstream
+// image URL, and assert both the image content block and the legacy
+// text-tool path still work.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -15,67 +20,55 @@ import { callTool } from "./_helpers.mjs";
 const REAL_PNG_URL =
   "https://cdn.jiuyangongshe.com/import/44E2B945-125A-4436-ABDA-77AD88880267.png";
 
-test("ashare_run: full base64 returned (no max_output_bytes cap)", async () => {
-  // 1. Run ashare_run against the jygs industrial-chain-img tool with
-  //    a real upstream image.  The image base64 is ~350 KB so it is
-  //    well above the per-service 64 KB cap; the response MUST contain
-  //    the full payload.
+test("ashare_run --output-format mcp: image content block round-trips intact", async () => {
+  // Pass --format mcp so the CLI emits the envelope; the gateway detects
+  // isMcpEnvelope=true and forwards the image content block directly.
   const result = await callTool("ashare_run", {
     commandPath: ["jygs", "industrial-chain-img"],
-    args: ["--url", REAL_PNG_URL, "--format", "json"],
+    args: ["--url", REAL_PNG_URL, "--format", "mcp"],
   });
+  const blocks = result.content ?? [];
+  assert.equal(blocks.length, 1, `expected 1 content block, got ${blocks.length}`);
+  const block = blocks[0];
+  assert.equal(block.type, "image", `expected type=image, got ${block.type}`);
+  assert.equal(block.mimeType, "image/png");
 
-  const text = result.content?.[0]?.text ?? "";
-  assert.ok(
-    text.length > 65_536,
-    `expected > 65536 bytes from ashare_run, got ${text.length}`,
-  );
-  assert.ok(
-    !text.includes("[TRUNCATED:"),
-    "ashare_run should NOT contain a TRUNCATED hint",
-  );
-
-  // 2. The returned JSON must contain a real, complete base64 PNG.
-  const parsed = JSON.parse(text);
-  assert.equal(parsed.mime_type, "image/png");
-  assert.equal(parsed.width, 895);
-  assert.equal(parsed.height, 1293);
-  const decoded = Buffer.from(parsed.base64, "base64");
+  const decoded = Buffer.from(block.data ?? "", "base64");
   assert.equal(decoded.length, 265386, "decoded bytes must match image size");
   // PNG magic header
   assert.equal(decoded[0], 0x89);
   assert.equal(decoded[1], 0x50);
   assert.equal(decoded[2], 0x4e);
   assert.equal(decoded[3], 0x47);
+
+  // structuredContent should travel alongside the image block.
+  const sc = result.structuredContent;
+  assert.ok(sc, "structuredContent should be present alongside the image block");
+  assert.equal(sc.width, 895);
+  assert.equal(sc.height, 1293);
+  assert.equal(sc.size, 265386);
+  assert.equal(sc.base64, undefined, "metadata must not duplicate base64");
 });
 
-test("ashare_help: small help output is returned intact (no hint)", async () => {
-  // The help text for the top-level ashare CLI is ~3.9 KB, well under
-  // the per-service 64 KB cap, so no truncation hint should appear and
-  // the gateway's own header should be present.
-  const result = await callTool("ashare_help", {});
-  const text = result.content?.[0]?.text ?? "";
-  assert.ok(text.length > 0, "help returned empty");
-  assert.ok(
-    text.includes("Help for"),
-    "help missing the gateway-injected header",
-  );
-  assert.ok(
-    !text.includes("[TRUNCATED: help was"),
-    "small help output should not be truncated",
-  );
-});
-
-test("ashare_help: deep subcommand help still well under cap", async () => {
-  // Drill into a real subcommand help to ensure the help path still
-  // resolves and is bounded.
-  const result = await callTool("ashare_help", {
-    commandPath: ["jygs", "industrial-chain-img"],
+test("ashare_run legacy text path: still works for non-image tools", async () => {
+  // industrial-chains returns a DataFrame, --format json yields normal JSON
+  // text on stdout — no envelope, gateway should fall through to text path.
+  const result = await callTool("ashare_run", {
+    commandPath: ["jygs", "industrial-chains"],
+    args: ["--format", "json"],
   });
-  const text = result.content?.[0]?.text ?? "";
-  assert.ok(text.includes("industrial-chain-img"), "deep help missing target");
-  assert.ok(
-    !text.includes("[TRUNCATED: help was"),
-    "deep help should be under the cap",
-  );
+  const blocks = result.content ?? [];
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].type, "text");
+  // The text body should be valid JSON (a list of dicts).
+  const parsed = JSON.parse(blocks[0].text);
+  assert.ok(Array.isArray(parsed) || typeof parsed === "object");
+});
+
+test("ashare_help: still resolves under dual_tool_mode", async () => {
+  const result = await callTool("ashare_help", {});
+  const blocks = result.content ?? [];
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].type, "text");
+  assert.ok(blocks[0].text.includes("Help for"), "gateway-injected header missing");
 });

@@ -439,17 +439,25 @@ function createServer() {
         throw new Error(`MCP client missing for service ${dispatch.serviceName}`);
       }
       const result = await caller.callTool(dispatch.originalName || tool.originalName || name, callArgs);
-      // Apply the same output-byte cap as for CLI tools so a runaway upstream
-      // can't blow up our response size.
-      let text = (result.content || [])
-        .map(c => c.type === "text" ? c.text : `[${c.type}]`)
-        .join("\n");
+      // Forward upstream content blocks faithfully.  Earlier versions of this
+      // adapter flattened everything to text and stringified non-text blocks
+      // as `[image]`, which silently broke image / audio / binary tools.
+      // Now we preserve each block's type and payload so a tool that returns
+      // {type: "image", mimeType, data} stays an image content block on the
+      // way out.  Text blocks still pass through the legacy max-bytes cap.
+      const blocks = result.content || [];
+      const textBlocks = blocks.filter(c => c.type === "text");
+      const otherBlocks = blocks.filter(c => c.type !== "text");
+      let text = textBlocks.map(c => c.text).join("\n");
       if (text.length > serviceMaxBytes) {
-        const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
+        const hint = `\n\n[TRUNCATED: text output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
         text = text.slice(0, serviceMaxBytes) + hint;
       }
+      const outBlocks = text.length > 0 ? [{ type: "text", text }] : [];
+      outBlocks.push(...otherBlocks);
       return {
-        content: [{ type: "text", text }],
+        content: outBlocks,
+        ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
         isError: Boolean(result.isError),
       };
     }
@@ -522,6 +530,44 @@ function createServer() {
       // should ask the underlying tool to scope its output (e.g. paginate,
       // limit, or stream).
       const text = r.stdout || "";
+      // If the CLI side asked for `--output-format mcp` and emitted a single-
+      // line MCP envelope, forward it verbatim.  This is how image / audio /
+      // binary content blocks survive the dual_tool_mode round-trip without
+      // exposing all 200+ subcommands to the model.  A tool that doesn't
+      // opt into this mode falls through to the legacy text content path.
+      //
+      // The envelope is signalled by an "isMcpEnvelope": true marker placed
+      // in the last line.  We strip any leading lines (Typer boot banner,
+      // log output, etc.), parse the final JSON object, and use its
+      // `result.content` + `result.structuredContent` directly.
+      const lines = text.split(/\r?\n/);
+      let envelopeLine = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        if (line.endsWith("}")) {
+          envelopeLine = line;
+          break;
+        }
+        // Bail as soon as we see a non-blank line that doesn't end with
+        // `}` — the envelope must be the last thing on stdout.
+        break;
+      }
+      if (envelopeLine && envelopeLine.includes('"isMcpEnvelope"') && envelopeLine.includes("true")) {
+        try {
+          const parsed = JSON.parse(envelopeLine);
+          const envResult = parsed.result || {};
+          return {
+            content: envResult.content || [],
+            ...(envResult.structuredContent !== undefined
+              ? { structuredContent: envResult.structuredContent }
+              : {}),
+            isError: Boolean(envResult.isError),
+          };
+        } catch {
+          // Fall through to text path on parse error.
+        }
+      }
       return { content: [{ type: "text", text }] };
     }
 
