@@ -473,8 +473,15 @@ function createServer() {
         extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
       });
       const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
-      const text = (r.stdout || r.stderr || "").trim()
+      let text = (r.stdout || r.stderr || "").trim()
         || `(${svc.command}${commandPathText} --help produced no output)`;
+      // Help text is metadata: it should be discoverable but not exhaust
+      // the output budget. Cap it so an unhelpfully wide help panel cannot
+      // starve downstream tool results.
+      if (text.length > serviceMaxBytes) {
+        const hint = `\n\n[TRUNCATED: help was ${text.length} bytes, only first ${serviceMaxBytes} shown. Pass a narrower commandPath to see less.]`;
+        text = text.slice(0, serviceMaxBytes) + hint;
+      }
       const target = `${svc.command}${commandPathText} --help`;
       const header = [
         `Help for ${svc.command}${commandPathText}.`,
@@ -507,11 +514,14 @@ function createServer() {
           content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
         };
       }
-      let text = r.stdout || "";
-      if (text.length > serviceMaxBytes) {
-        const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown. Re-run with a narrower scope to get a smaller result.]`;
-        text = text.slice(0, serviceMaxBytes) + hint;
-      }
+      // The run tool returns the *actual* tool result (e.g. a fetched image
+      // as base64, a downloaded report, a non-trivial analysis result). Truncating
+      // it here would silently break the consumer — for example, slicing a
+      // base64-encoded PNG corrupts the image. Skip the output-byte cap so
+      // callers receive the full stdout. Callers that need bounded payloads
+      // should ask the underlying tool to scope its output (e.g. paginate,
+      // limit, or stream).
+      const text = r.stdout || "";
       return { content: [{ type: "text", text }] };
     }
 
