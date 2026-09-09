@@ -19,8 +19,11 @@ import { callTool } from "./_helpers.mjs";
 
 const REAL_PNG_URL =
   "https://cdn.jiuyangongshe.com/import/44E2B945-125A-4436-ABDA-77AD88880267.png";
+const liveTest = process.env.ASHARE_MCP_TEST_TOKEN || process.env.ASHARE_MCP_TEST_ENV_FILE
+  ? test
+  : test.skip;
 
-test("ashare_run --output-format mcp: image content block round-trips intact", async () => {
+liveTest("ashare_run --output-format mcp: image content block round-trips intact", async () => {
   // Pass --format mcp so the CLI emits the envelope; the gateway detects
   // isMcpEnvelope=true and forwards the image content block directly.
   const result = await callTool("ashare_run", {
@@ -50,7 +53,7 @@ test("ashare_run --output-format mcp: image content block round-trips intact", a
   assert.equal(sc.base64, undefined, "metadata must not duplicate base64");
 });
 
-test("ashare_run legacy text path: still works for non-image tools", async () => {
+liveTest("ashare_run legacy text path: still works for non-image tools", async () => {
   // industrial-chains returns a DataFrame, --format json yields normal JSON
   // text on stdout — no envelope, gateway should fall through to text path.
   const result = await callTool("ashare_run", {
@@ -65,7 +68,7 @@ test("ashare_run legacy text path: still works for non-image tools", async () =>
   assert.ok(Array.isArray(parsed) || typeof parsed === "object");
 });
 
-test("ashare_help: still resolves under dual_tool_mode", async () => {
+liveTest("ashare_help: still resolves under dual_tool_mode", async () => {
   const result = await callTool("ashare_help", {});
   const blocks = result.content ?? [];
   assert.equal(blocks.length, 1);

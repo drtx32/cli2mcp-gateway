@@ -7,14 +7,22 @@
 //   3. POST tools/call with the same `mcp-session-id` header.
 
 import { request as httpRequest } from "node:http";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 export const mcpPath = "/mcp";
 
 export function bearer() {
-  const envText = readFileSync("/etc/cli2mcp/bearer.env", "utf8");
+  if (process.env.ASHARE_MCP_TEST_TOKEN) return process.env.ASHARE_MCP_TEST_TOKEN;
+
+  const envPath = process.env.ASHARE_MCP_TEST_ENV_FILE || "/etc/cli2mcp/bearer.env";
+  if (!existsSync(envPath)) {
+    throw new Error(
+      "set ASHARE_MCP_TEST_TOKEN or ASHARE_MCP_TEST_ENV_FILE to run live ashare tests",
+    );
+  }
+  const envText = readFileSync(envPath, "utf8");
   const match = envText.match(/^MCP_TOKEN=(.+)$/m);
-  if (!match) throw new Error("MCP_TOKEN not found in /etc/cli2mcp/bearer.env");
+  if (!match) throw new Error(`MCP_TOKEN not found in ${envPath}`);
   return match[1].trim();
 }
 
