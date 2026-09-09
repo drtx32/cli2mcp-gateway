@@ -28,10 +28,11 @@ import {
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execa } from "execa";
-import { discoverTools, buildArgv } from "./help-parser.js";
+import { discoverTools, buildArgv, captureHelp, parseSubcommandNames } from "./help-parser.js";
 import { loadBoxConfig, legacyEnvConfig, configSummary } from "./box-config.mjs";
 import { aggregateTools, buildDispatchTable, resolveToolCall } from "./tool-aggregator.mjs";
-import { discoverStdioMcp } from "./adapters/mcp-stdio.mjs";
+import { discoverStdioMcp, isStdioMcp } from "./adapters/mcp-stdio.mjs";
+import { discoverHttpMcp } from "./adapters/mcp-http.mjs";
 import { buildServiceEnv } from "./service-env.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -60,6 +61,7 @@ const env = {
   // Empty = allow all (rely on bearer / OAuth alone).
   ALLOWED_IPS:       (process.env.MCP_ALLOWED_IPS || process.env.ALLOWED_IPS || "").split(",").map(v => v.trim()).filter(Boolean),
   CORS_ORIGINS:      (process.env.CORS_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean),
+  MCP_PATH:          process.env.MCP_PATH || "/mcp",
   RATE_LIMIT_RPS:    Number(process.env.RATE_LIMIT_RPS || 20),    // 每 IP 每秒
   RATE_LIMIT_BURST:  Number(process.env.RATE_LIMIT_BURST || 40),
   // Downstream CLI: directly spawned by the gateway (no nested cli2mcp npm
@@ -80,18 +82,6 @@ const env = {
   STDIO_IDLE_TIMEOUT_SEC: Number(process.env.STDIO_IDLE_TIMEOUT_SEC || 0),
   STDIO_BOOT_TIMEOUT_SEC: Number(process.env.STDIO_BOOT_TIMEOUT_SEC || 0),
 };
-
-if (!["bearer", "oauth", "both"].includes(env.AUTH_MODE)) {
-  console.error(`AUTH_MODE must be bearer | oauth | both, got "${env.AUTH_MODE}"`);
-  process.exit(1);
-}
-
-if (!env.PUBLIC_ENDPOINT) {
-  env.PUBLIC_ENDPOINT = `http://${env.HOST}:${env.PORT}`;
-}
-if (!env.OAUTH_ISSUER) {
-  env.OAUTH_ISSUER = env.PUBLIC_ENDPOINT;
-}
 
 // Token: 优先级 MCP_TOKEN > AUTH_MODE=oauth 时空 > 随机
 // Override env values with box config (only for fields box config actually
@@ -125,25 +115,9 @@ function applyBoxConfigToEnv(box) {
   if (box.config.health?.path) {
     env.HEALTH_PATH = box.config.health.path;
   }
-}
-
-env.TOKEN = env.MCP_TOKEN
-  || (env.AUTH_MODE === "oauth" ? "" : randomBytes(24).toString("base64url"));
-
-// OAuth 需要 https(本地例外)
-const oauthNeeded = ["oauth", "both"].includes(env.AUTH_MODE) || Boolean(env.AUTH0_ISSUER);
-if (oauthNeeded && !env.PUBLIC_ENDPOINT.startsWith("https://")
-    && env.HOST !== "127.0.0.1" && env.HOST !== "localhost") {
-  console.error("OAuth public deployments require PUBLIC_ENDPOINT=https://...");
-  process.exit(1);
-}
-// Lazy validation of OAUTH_PASSWORD — only fail when OAuth flow actually runs.
-if (oauthNeeded && env.AUTH_MODE !== "both" && !Boolean(env.AUTH0_ISSUER)
-    && (!env.OAUTH_PASSWORD || env.OAUTH_PASSWORD.length === 0)) {
-  console.error("[boot] OAUTH_PASSWORD not set. Refusing to start with insecure default. " +
-    "Either set OAUTH_PASSWORD (and OAUTH_USERNAME) in the environment, " +
-    "or use AUTH_MODE=bearer / AUTH_MODE=both (no password required).");
-  process.exit(1);
+  if (box.config.transport?.path) {
+    env.MCP_PATH = box.config.transport.path;
+  }
 }
 
 // ===== 2. CLI 子命令路由 =====
@@ -279,6 +253,33 @@ if (argv.includes("--http") && argv.includes("--stdio")) {
 // config-file path gets the configured values.
 applyBoxConfigToEnv(box);
 
+// Derive endpoint and security state only after box.yaml has been applied.
+if (!process.env.PUBLIC_ENDPOINT) {
+  env.PUBLIC_ENDPOINT = `http://${env.HOST}:${env.PORT}`;
+}
+if (!process.env.OAUTH_ISSUER) {
+  env.OAUTH_ISSUER = env.PUBLIC_ENDPOINT;
+}
+if (!["bearer", "oauth", "both", "auth0", "none"].includes(env.AUTH_MODE)) {
+  console.error(`AUTH_MODE must be bearer | oauth | both | auth0 | none, got "${env.AUTH_MODE}"`);
+  process.exit(1);
+}
+env.TOKEN = env.MCP_TOKEN
+  || (["oauth", "auth0", "none"].includes(env.AUTH_MODE) ? "" : randomBytes(24).toString("base64url"));
+const oauthNeeded = ["oauth", "both", "auth0"].includes(env.AUTH_MODE) || Boolean(env.AUTH0_ISSUER);
+if (oauthNeeded && !env.PUBLIC_ENDPOINT.startsWith("https://")
+    && env.HOST !== "127.0.0.1" && env.HOST !== "localhost") {
+  console.error("OAuth public deployments require PUBLIC_ENDPOINT=https://...");
+  process.exit(1);
+}
+if (oauthNeeded && env.AUTH_MODE !== "both" && !Boolean(env.AUTH0_ISSUER)
+    && (!env.OAUTH_PASSWORD || env.OAUTH_PASSWORD.length === 0)) {
+  console.error("[boot] OAUTH_PASSWORD not set. Refusing to start with insecure default. " +
+    "Either set OAUTH_PASSWORD (and OAUTH_USERNAME) in the environment, " +
+    "or use AUTH_MODE=bearer / AUTH_MODE=both (no password required).");
+  process.exit(1);
+}
+
 // ===== 3. 共用层:多 service 工具发现 + 聚合 =====
 //
 // For each service in the box config, run the adapter's discover() to
@@ -304,7 +305,33 @@ const perServiceTools = {};
 /** @type {Record<string, { callTool: (name: string, args: any) => Promise<any>, close: () => Promise<void> }>} */
 const perServiceCallers = {};
 
-for (const [serviceName, svc] of Object.entries(box.config.services)) {
+for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) {
+  let svc = configuredSvc;
+  if (svc.adapter === "auto") {
+    const serviceEnv = buildServiceEnv(process.env, svc.env || {});
+    const topHelp = await captureHelp(svc.command, [], svc.timeout_ms, {
+      baseArgs: svc.args || [],
+      cwd: svc.cwd,
+      env: serviceEnv,
+    });
+    const topCommands = parseSubcommandNames(topHelp);
+    const mcpArgs = topCommands.includes("mcp")
+      ? [...(svc.args || []), "mcp"]
+      : [...(svc.args || [])];
+    const detectedMcp = await isStdioMcp({
+      name: serviceName,
+      command: svc.command,
+      args: mcpArgs,
+      env: svc.env || {},
+      cwd: svc.cwd,
+    });
+    svc = detectedMcp
+      ? { ...svc, adapter: "mcp-stdio", args: mcpArgs }
+      : { ...svc, adapter: "cli" };
+    box.config.services[serviceName] = svc;
+    console.error("[boot] auto adapter " + serviceName + " -> " + svc.adapter +
+      (detectedMcp && topCommands.includes("mcp") ? " (mcp subcommand)" : ""));
+  }
   if (svc.adapter === "cli") {
     const subcmds = svc.subcommands && svc.subcommands.length > 0 ? svc.subcommands : null;
     // dual_tool_mode can be set on the service directly (preferred) or via
@@ -322,7 +349,14 @@ for (const [serviceName, svc] of Object.entries(box.config.services)) {
     perServiceTools[serviceName] = await discoverTools(
       svc.command,
       subcmds,
-      { dualToolMode: dualMode, skipRecursive: skipRec, cwd: svc.cwd },
+      {
+        dualToolMode: dualMode,
+        skipRecursive: skipRec,
+        baseArgs: svc.args || [],
+        cwd: svc.cwd,
+        env: buildServiceEnv(process.env, svc.env || {}),
+        helpTimeoutMs: svc.timeout_ms,
+      },
     );
   } else if (svc.adapter === "mcp-stdio") {
     const { tools, client, close } = await discoverStdioMcp({
@@ -331,6 +365,18 @@ for (const [serviceName, svc] of Object.entries(box.config.services)) {
       args: svc.args || [],
       env: svc.env || {},
       cwd: svc.cwd,
+    });
+    perServiceTools[serviceName] = tools;
+    perServiceCallers[serviceName] = {
+      callTool: (name, args) => client.callTool({ name, arguments: args ?? {} }),
+      close,
+    };
+  } else if (svc.adapter === "mcp-http") {
+    const { tools, client, close } = await discoverHttpMcp({
+      name: serviceName,
+      url: svc.url,
+      headers: svc.headers || {},
+      auth: svc.auth || {},
     });
     perServiceTools[serviceName] = tools;
     perServiceCallers[serviceName] = {
@@ -387,23 +433,31 @@ function createServer() {
     // mcp-stdio adapter: forward the call through the per-service MCP client
     // we set up at boot. No subprocess spawn here — the stdio MCP server is
     // already running, we just round-trip the JSON-RPC.
-    if (svc.adapter === "mcp-stdio") {
+    if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
       const caller = perServiceCallers[dispatch.serviceName];
       if (!caller) {
         throw new Error(`MCP client missing for service ${dispatch.serviceName}`);
       }
-      const result = await caller.callTool(tool.originalName, callArgs);
-      // Apply the same output-byte cap as for CLI tools so a runaway upstream
-      // can't blow up our response size.
-      let text = (result.content || [])
-        .map(c => c.type === "text" ? c.text : `[${c.type}]`)
-        .join("\n");
+      const result = await caller.callTool(dispatch.originalName || tool.originalName || name, callArgs);
+      // Forward upstream content blocks faithfully.  Earlier versions of this
+      // adapter flattened everything to text and stringified non-text blocks
+      // as `[image]`, which silently broke image / audio / binary tools.
+      // Now we preserve each block's type and payload so a tool that returns
+      // {type: "image", mimeType, data} stays an image content block on the
+      // way out.  Text blocks still pass through the legacy max-bytes cap.
+      const blocks = result.content || [];
+      const textBlocks = blocks.filter(c => c.type === "text");
+      const otherBlocks = blocks.filter(c => c.type !== "text");
+      let text = textBlocks.map(c => c.text).join("\n");
       if (text.length > serviceMaxBytes) {
-        const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
+        const hint = `\n\n[TRUNCATED: text output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
         text = text.slice(0, serviceMaxBytes) + hint;
       }
+      const outBlocks = text.length > 0 ? [{ type: "text", text }] : [];
+      outBlocks.push(...otherBlocks);
       return {
-        content: [{ type: "text", text }],
+        content: outBlocks,
+        ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
         isError: Boolean(result.isError),
       };
     }
@@ -412,7 +466,7 @@ function createServer() {
     // raw text. This is the agent's primary way to discover what's available
     // without burning output budget on broad enumeration tools.
     if (tool.dispatch && tool.dispatch.kind === "help") {
-      const argv = [];
+      const argv = [...(svc.args || [])];
       const commandPath = Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0
         ? callArgs.commandPath
         : (typeof callArgs.sub === "string" && callArgs.sub ? [callArgs.sub] : []);
@@ -427,8 +481,15 @@ function createServer() {
         extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
       });
       const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
-      const text = (r.stdout || r.stderr || "").trim()
+      let text = (r.stdout || r.stderr || "").trim()
         || `(${svc.command}${commandPathText} --help produced no output)`;
+      // Help text is metadata: it should be discoverable but not exhaust
+      // the output budget. Cap it so an unhelpfully wide help panel cannot
+      // starve downstream tool results.
+      if (text.length > serviceMaxBytes) {
+        const hint = `\n\n[TRUNCATED: help was ${text.length} bytes, only first ${serviceMaxBytes} shown. Pass a narrower commandPath to see less.]`;
+        text = text.slice(0, serviceMaxBytes) + hint;
+      }
       const target = `${svc.command}${commandPathText} --help`;
       const header = [
         `Help for ${svc.command}${commandPathText}.`,
@@ -442,7 +503,7 @@ function createServer() {
     // verbatim, no --help appended. Lets the agent reach nested subcommands that
     // per-tool schema inference can't represent.
     if (tool.dispatch && tool.dispatch.kind === "run") {
-      const argv = [];
+      const argv = [...(svc.args || [])];
       const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
       if (commandPath.length > 0) argv.push(...commandPath);
       if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
@@ -461,15 +522,56 @@ function createServer() {
           content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
         };
       }
-      let text = r.stdout || "";
-      if (text.length > serviceMaxBytes) {
-        const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown. Re-run with a narrower scope to get a smaller result.]`;
-        text = text.slice(0, serviceMaxBytes) + hint;
+      // The run tool returns the *actual* tool result (e.g. a fetched image
+      // as base64, a downloaded report, a non-trivial analysis result). Truncating
+      // it here would silently break the consumer — for example, slicing a
+      // base64-encoded PNG corrupts the image. Skip the output-byte cap so
+      // callers receive the full stdout. Callers that need bounded payloads
+      // should ask the underlying tool to scope its output (e.g. paginate,
+      // limit, or stream).
+      const text = r.stdout || "";
+      // If the CLI side asked for `--output-format mcp` and emitted a single-
+      // line MCP envelope, forward it verbatim.  This is how image / audio /
+      // binary content blocks survive the dual_tool_mode round-trip without
+      // exposing all 200+ subcommands to the model.  A tool that doesn't
+      // opt into this mode falls through to the legacy text content path.
+      //
+      // The envelope is signalled by an "isMcpEnvelope": true marker placed
+      // in the last line.  We strip any leading lines (Typer boot banner,
+      // log output, etc.), parse the final JSON object, and use its
+      // `result.content` + `result.structuredContent` directly.
+      const lines = text.split(/\r?\n/);
+      let envelopeLine = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        if (line.endsWith("}")) {
+          envelopeLine = line;
+          break;
+        }
+        // Bail as soon as we see a non-blank line that doesn't end with
+        // `}` — the envelope must be the last thing on stdout.
+        break;
+      }
+      if (envelopeLine && envelopeLine.includes('"isMcpEnvelope"') && envelopeLine.includes("true")) {
+        try {
+          const parsed = JSON.parse(envelopeLine);
+          const envResult = parsed.result || {};
+          return {
+            content: envResult.content || [],
+            ...(envResult.structuredContent !== undefined
+              ? { structuredContent: envResult.structuredContent }
+              : {}),
+            isError: Boolean(envResult.isError),
+          };
+        } catch {
+          // Fall through to text path on parse error.
+        }
       }
       return { content: [{ type: "text", text }] };
     }
 
-    const argv = [];
+    const argv = [...(svc.args || [])];
     const commandPath = Array.isArray(tool.dispatch.commandPath)
       ? tool.dispatch.commandPath
       : (tool.dispatch.subcommand ? [tool.dispatch.subcommand] : []);
@@ -807,7 +909,7 @@ async function runHttp() {
 
   if (oauthNeeded) {
     app.get("/.well-known/oauth-protected-resource", (_req, res) => res.json({
-      resource: `${env.PUBLIC_ENDPOINT}/mcp`,
+      resource: `${env.PUBLIC_ENDPOINT}${env.MCP_PATH}`,
       authorization_servers: [env.AUTH0_ISSUER || env.OAUTH_ISSUER],
       bearer_methods_supported: ["header"],
       scopes_supported: env.AUTH0_ISSUER ? [env.AUTH0_REQ_SCOPE, "offline_access"] : ["tools:read", "tools:write"],
@@ -897,7 +999,7 @@ async function runHttp() {
 
   // ----- 5.4 /mcp endpoint -----
   const transports = new Map();
-  app.all("/mcp", async (req, res) => {
+  app.all(env.MCP_PATH, async (req, res) => {
     if (!(await authorized(req, res))) return;
     const sessionId = req.headers["mcp-session-id"];
     let transport = sessionId ? transports.get(sessionId) : undefined;

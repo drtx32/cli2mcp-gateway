@@ -3,7 +3,7 @@
 const { spawn } = require("node:child_process");
 const { resolve } = require("node:path");
 
-const entry = resolve(__dirname, "..", "src", "server.mjs");
+const entry = resolve(__dirname, "..", "src", "cli.mjs");
 const child = spawn(process.execPath, [entry, ...process.argv.slice(2)], {
   stdio: "inherit",
   windowsHide: true,

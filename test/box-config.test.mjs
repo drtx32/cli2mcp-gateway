@@ -67,6 +67,33 @@ auth:
   assert.equal(config.auth.token, "abc");
 });
 
+test("loadBoxConfig: accepts auto and mcp-http service adapters", () => {
+  const dir = fs.mkdtempSync(path.resolve(os.tmpdir(), "cli2mcp-adapters-"));
+  const boxPath = path.resolve(dir, "box.yaml");
+  try {
+    fs.writeFileSync(boxPath, [
+      "name: adapters",
+      "services:",
+      "  detected:",
+      "    adapter: auto",
+      "    command: node",
+      "  remote:",
+      "    adapter: mcp-http",
+      "    url: https://example.com/mcp",
+      "    auth: {type: bearer, token: token}",
+      "transport: {type: stdio}",
+      "",
+    ].join("\n"), "utf8");
+    const { config } = loadBoxConfig(boxPath);
+    assert.equal(config.services.detected.adapter, "auto");
+    assert.equal(config.services.remote.adapter, "mcp-http");
+    assert.equal(config.services.remote.auth.token, "token");
+  } finally {
+    if (fs.existsSync(boxPath)) fs.unlinkSync(boxPath);
+    if (fs.existsSync(dir)) fs.rmdirSync(dir);
+  }
+});
+
 test("loadBoxConfig: rejects unknown adapter kind at the schema layer", () => {
   const yaml = `
 name: bad

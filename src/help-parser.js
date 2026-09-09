@@ -20,14 +20,14 @@ import { execa } from "execa";
  * Time out fast — most CLIs answer --help instantly; the 5s guard prevents
  * wedging the gateway if the CLI hangs.
  */
-export async function captureHelp(cmd, args = [], timeoutMs = 5_000) {
-  const helpArgs = [...args, "--help"];
+export async function captureHelp(cmd, args = [], timeoutMs = 5_000, options = {}) {
+  const helpArgs = [...(options.baseArgs || []), ...args, "--help"];
   try {
     const r = await execa(cmd, helpArgs, {
       timeout: timeoutMs,
       reject: false,
-      env: process.env,
-      cwd: process.env.CLI_CWD || process.env.CLI2MCP_CWD || process.cwd(),
+      env: options.env || process.env,
+      cwd: options.cwd || process.env.CLI_CWD || process.env.CLI2MCP_CWD || process.cwd(),
     });
     return [r.stdout || "", r.stderr || ""].filter(Boolean).join("\n");
   } catch (err) {
@@ -395,7 +395,17 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
   // detail). Tool calls still get the full <cli> <sub> <sub> argv, so
   // execution works as long as the top-level schema isn't required.
   const skipRecursive = options.skipRecursive === true;
-  const topHelp = await captureHelpFn(baseCmd, []);
+  const capture = (commandPath) => captureHelpFn(
+    baseCmd,
+    commandPath,
+    options.helpTimeoutMs ?? 5_000,
+    {
+      baseArgs: options.baseArgs || [],
+      cwd: options.cwd,
+      env: options.env,
+    },
+  );
+  const topHelp = await capture([]);
   const roots = dualToolMode
     ? []
     : (subcommands && subcommands.length > 0
@@ -461,7 +471,7 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
   }
 
   async function walk(commandPath) {
-    const helpText = await captureHelpFn(baseCmd, commandPath);
+    const helpText = await capture(commandPath);
     if (!helpText.trim()) return;
     const subcommands = parseSubcommandNames(helpText);
     if (subcommands.length > 0) {
