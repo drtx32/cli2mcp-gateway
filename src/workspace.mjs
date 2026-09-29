@@ -138,22 +138,29 @@ function buildRuntime(root, cfg, toolMode) {
     root,
     followSymlinks: cfg.follow_symlinks === true,
     allowHidden: cfg.allow_hidden_files === true,
-    maxTotalBytes: numOr(cfg.max_total_bytes, DEFAULT_MAX_TOTAL_BYTES),
-    maxFileBytes: numOr(cfg.max_file_bytes, DEFAULT_MAX_FILE_BYTES),
-    maxFiles: numOr(cfg.max_files, DEFAULT_MAX_FILES),
+    maxTotalBytes: numOrPos(cfg.max_total_bytes, DEFAULT_MAX_TOTAL_BYTES),
+    maxFileBytes: numOrPos(cfg.max_file_bytes, DEFAULT_MAX_FILE_BYTES),
+    maxFiles: numOrPos(cfg.max_files, DEFAULT_MAX_FILES),
     maxReadBytes: Math.min(
-      numOr(cfg.max_read_bytes, DEFAULT_MAX_READ_BYTES),
-      numOr(cfg.max_file_bytes, DEFAULT_MAX_FILE_BYTES),
+      numOrPos(cfg.max_read_bytes, DEFAULT_MAX_READ_BYTES),
+      numOrPos(cfg.max_file_bytes, DEFAULT_MAX_FILE_BYTES),
     ),
-    maxListEntries: numOr(cfg.max_list_entries, DEFAULT_MAX_LIST_ENTRIES),
-    ttlSeconds: numOr(cfg.ttl_seconds, DEFAULT_TTL_SECONDS),
+    maxListEntries: numOrPos(cfg.max_list_entries, DEFAULT_MAX_LIST_ENTRIES),
+    // TTL uses numOrZero so an explicit `ttl_seconds: 0` (or any non-negative
+    // finite number) is honoured; only undefined / non-finite falls back to
+    // the default. Zero means "never expire by age".
+    ttlSeconds: numOrZero(cfg.ttl_seconds, DEFAULT_TTL_SECONDS),
     cleanupPolicy: cfg.cleanup_policy || "oldest_first",
     toolMode,
   };
 }
 
-function numOr(v, dflt) {
+function numOrPos(v, dflt) {
   return Number.isFinite(v) && v > 0 ? v : dflt;
+}
+
+function numOrZero(v, dflt) {
+  return Number.isFinite(v) && v >= 0 ? v : dflt;
 }
 
 /**
@@ -321,7 +328,10 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
     let ents;
     try { ents = await readdir(abs, { withFileTypes: true }); } catch { continue; }
     for (const ent of ents) {
-      if (!runtime.allowHidden && ent.name.startsWith(".")) continue;
+      // Visibility policy (allow_hidden_files) only affects what the agent
+      // sees via list/read/stat — NOT what counts against disk quota. A
+      // downstream CLI filling the disk through `.cache/artifact` would
+      // otherwise be invisible to enforceQuotas. We walk every entry here.
       const childRel = rel === "." ? ent.name : `${rel}${sep}${ent.name}`;
       const childAbs = `${abs}${sep}${ent.name}`;
       let st;

@@ -313,6 +313,7 @@ const perServiceTools = {};
 const perServiceCallers = {};
 /** @type {Record<string, ReturnType<typeof resolveWorkspaceConfig>>} workspace runtime per service, or null if not active */
 const perServiceWorkspace = {};
+const perServiceUpstreamMcpTools = {};
 
 const boxConfigDir = box.path ? dirname(resolve(box.path)) : process.cwd();
 
@@ -362,10 +363,17 @@ function syntheticHelpRunSpecs(serviceName) {
             items: { type: "string" },
             description: "Tool name (one-element array), e.g. ['list_things'].",
           },
+          // MCP tools typically accept an object of named arguments (e.g.
+          // {text: "hello", limit: 5}). We also accept an array of positional
+          // strings for CLI-emulating callers that haven't been rewritten yet.
+          // The dispatcher forwards `args` verbatim to the upstream client.
           args: {
-            type: "array",
-            items: { type: "string" },
-            description: "Args forwarded verbatim as the tool's input.",
+            description:
+              "Arguments forwarded to the upstream MCP tool. Object of named params (typical MCP shape) or array of positional strings (CLI shape).",
+            oneOf: [
+              { type: "object", additionalProperties: true },
+              { type: "array", items: { type: "string" } },
+            ],
           },
           stdin: { type: "string", description: "Optional: piped into the tool's stdin." },
         },
@@ -456,6 +464,12 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
       cwd: svc.cwd,
     });
     const mcpToolMode = resolveToolMode(svc);
+    // Preserve the upstream catalog BEFORE applyToolModeToMcpCatalog replaces
+    // it under dual / triple mode. The synthetic help tool needs to list the
+    // original upstream tool names so callers know what to pass via
+    // `<svc>_run` commandPath. Without this snapshot the help page would only
+    // advertise the synthetic `<svc>_help` and `<svc>_run` themselves.
+    perServiceUpstreamMcpTools[serviceName] = tools;
     perServiceTools[serviceName] = applyToolModeToMcpCatalog(tools, svc, mcpToolMode, serviceName);
     perServiceCallers[serviceName] = {
       callTool: (name, args) => client.callTool({ name, arguments: args ?? {} }),
@@ -469,6 +483,7 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
       auth: svc.auth || {},
     });
     const mcpToolMode = resolveToolMode(svc);
+    perServiceUpstreamMcpTools[serviceName] = tools;
     perServiceTools[serviceName] = applyToolModeToMcpCatalog(tools, svc, mcpToolMode, serviceName);
     perServiceCallers[serviceName] = {
       callTool: (name, args) => client.callTool({ name, arguments: args ?? {} }),
@@ -516,6 +531,178 @@ const allowedTools = new Set(tools.map((tool) => tool.name));
 const toolByName = new Map(tools.map(tool => [tool.name, tool]));
 
 // 共用业务层:无论 stdio 还是 http 都用这个 createServer
+/**
+ * Dispatch synthetic `_help` and `_run` calls. Used for both CLI adapters
+ * (where help spawns `<cli> [sub] --help` and run spawns the underlying
+ * command verbatim) and mcp-stdio / mcp-http adapters (where help synthesises
+ * a gateway-managed help page from the preserved upstream catalog and run
+ * forwards through the per-service MCP client).
+ *
+ * Extracted out of createServer so:
+ *   - synthetic dispatch runs BEFORE the mcp forwarding branch, preventing an
+ *     upstream tool named `<svc>_help` from shadowing the synthetic one;
+ *   - the same handler covers every adapter without duplicating logic.
+ */
+async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
+  const svc = box.config.services[dispatch.serviceName];
+  const serviceCwd = ctxEnv.serviceCwd;
+  const serviceTimeout = ctxEnv.serviceTimeout;
+  const serviceMaxBytes = ctxEnv.serviceMaxBytes;
+  const serviceEnv = ctxEnv.serviceEnv;
+  const kind = tool.dispatch.kind;
+
+  if (kind === "help") {
+    const commandPath = Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0
+      ? callArgs.commandPath
+      : (typeof callArgs.sub === "string" && callArgs.sub ? [callArgs.sub] : []);
+    // Synthetic gateway-managed workspace help: when the agent asks for
+    // ["workspace"], return our text instead of forwarding to `<cli>
+    // workspace --help`. Workspace is read-only and lives entirely inside
+    // the gateway — there's no underlying CLI command to run.
+    if (commandPath.length === 1 && commandPath[0] === "workspace" && perServiceWorkspace[dispatch.serviceName]) {
+      return { content: [{ type: "text", text: workspaceHelpText() }] };
+    }
+    if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
+      const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
+      // Build the synthetic MCP help page from the preserved upstream
+      // catalog (recorded before applyToolModeToMcpCatalog replaced it
+      // under dual / triple mode). In normal mode this is the same as the
+      // active catalog. Callers use these names with `<svc>_run`.
+      const upstream = perServiceUpstreamMcpTools[dispatch.serviceName] || [];
+      const lines = [
+        `Help for MCP service "${dispatch.serviceName}"${commandPathText}.`,
+        `Adapter: ${svc.adapter}.`,
+        `Tool mode: ${resolveToolMode(svc)}.`,
+        "",
+        "Available upstream tools (use `<svc>_run` with commandPath=['<tool_name>']):",
+        ...upstream.map(t =>
+          `  - ${t.name}: ${(t.description || "").split(/\r?\n/)[0].slice(0, 160)}`,
+        ),
+      ];
+      let text = lines.join("\n");
+      if (text.length > serviceMaxBytes) {
+        text = text.slice(0, serviceMaxBytes) +
+          `\n\n[TRUNCATED: help was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
+      }
+      const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
+        ? "\n\n---\n\n" + workspaceHelpText()
+        : "";
+      return { content: [{ type: "text", text: text + workspaceSection }] };
+    }
+    const argv = [...(svc.args || [])];
+    if (commandPath.length > 0) argv.push(...commandPath);
+    argv.push("--help");
+    if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
+    const r = await execa(svc.command, argv, {
+      cwd: serviceCwd,
+      timeout: serviceTimeout,
+      reject: false,
+      env: serviceEnv,
+      extendEnv: false,
+    });
+    const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
+    let text = (r.stdout || r.stderr || "").trim()
+      || `(${svc.command}${commandPathText} --help produced no output)`;
+    if (text.length > serviceMaxBytes) {
+      const hint = `\n\n[TRUNCATED: help was ${text.length} bytes, only first ${serviceMaxBytes} shown. Pass a narrower commandPath to see less.]`;
+      text = text.slice(0, serviceMaxBytes) + hint;
+    }
+    const target = `${svc.command}${commandPathText} --help`;
+    const header = [
+      `Help for ${svc.command}${commandPathText}.`,
+      `Use this meta-tool to inspect the CLI, or pass "commandPath" (preferred) or "sub" plus "args" to drill down into a command help page.`,
+      `Raw output from ${target}:`,
+    ].join("\n");
+    const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
+      ? "\n\n---\n\n" + workspaceHelpText()
+      : "";
+    return { content: [{ type: "text", text: `${header}\n\n${text}${workspaceSection}` }] };
+  }
+
+  if (kind === "run") {
+    if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
+      const caller = perServiceCallers[dispatch.serviceName];
+      if (!caller) {
+        throw new Error(`MCP client missing for service ${dispatch.serviceName}`);
+      }
+      const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
+      const upstreamName = commandPath[0];
+      if (!upstreamName) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `${dispatch.serviceName}_run requires commandPath=['<tool_name>'] for MCP adapters.` }],
+        };
+      }
+      // `args` may be either an object of named arguments (the typical MCP
+      // shape) or an array of positional strings (CLI-emulating callers).
+      // Schema below permits both.
+      const args = callArgs.args;
+      const result = await caller.callTool(upstreamName, args);
+      const blocks = result.content || [];
+      const textBlocks = blocks.filter(c => c.type === "text");
+      const otherBlocks = blocks.filter(c => c.type !== "text");
+      let text = textBlocks.map(c => c.text).join("\n");
+      if (text.length > serviceMaxBytes) {
+        text = text.slice(0, serviceMaxBytes) +
+          `\n\n[TRUNCATED: text output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
+      }
+      const outBlocks = text.length > 0 ? [{ type: "text", text }] : [];
+      outBlocks.push(...otherBlocks);
+      return {
+        content: outBlocks,
+        ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
+        isError: Boolean(result.isError),
+      };
+    }
+    const argv = [...(svc.args || [])];
+    const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
+    if (commandPath.length > 0) argv.push(...commandPath);
+    if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
+    const r = await execa(svc.command, argv, {
+      cwd: serviceCwd,
+      timeout: serviceTimeout,
+      reject: false,
+      env: serviceEnv,
+      extendEnv: false,
+      input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
+    });
+    if (r.exitCode !== 0) {
+      const errText = (r.stderr || r.stdout || "").trim();
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
+      };
+    }
+    const text = r.stdout || "";
+    const lines = text.split(/\r?\n/);
+    let envelopeLine = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (line.endsWith("}")) { envelopeLine = line; break; }
+      break;
+    }
+    if (envelopeLine && envelopeLine.includes('"isMcpEnvelope"') && envelopeLine.includes("true")) {
+      try {
+        const parsed = JSON.parse(envelopeLine);
+        const envResult = parsed.result || {};
+        return {
+          content: envResult.content || [],
+          ...(envResult.structuredContent !== undefined
+            ? { structuredContent: envResult.structuredContent }
+            : {}),
+          isError: Boolean(envResult.isError),
+        };
+      } catch {
+        // Fall through to text path on parse error.
+      }
+    }
+    return { content: [{ type: "text", text }] };
+  }
+
+  throw new Error(`dispatchSyntheticCall: unknown dispatch kind "${kind}"`);
+}
+
 function createServer() {
   const server = new Server(
     { name: "cli2mcp-gateway", version: "1.0.0" },
@@ -568,6 +755,25 @@ function createServer() {
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     }
 
+    // Synthetic "help" tool (CLI adapter: `<cli> [sub] --help`) and
+    // synthetic "run" tool (CLI adapter: `<cli> <commandPath...> <args...>`):
+    // execute the underlying CLI verbatim. Same shape works for both — see
+    // the dispatch.kind branches below for adapter-specific handling.
+    //
+    // For mcp-stdio / mcp-http adapters, dispatch.kind=help synthesises a
+    // gateway-managed help page from the preserved upstream catalog (see
+    // upstreamMcpCatalog map below) and dispatch.kind=run forwards to the
+    // per-service MCP client using commandPath[0] as the upstream tool name
+    // and callArgs.args (object or array) as the tool arguments.
+    //
+    // We intercept these BEFORE the mcp forwarding branch so an MCP upstream
+    // tool with an awkward name such as `svc_help` cannot shadow the gateway's
+    // local synthetic one — and so the synthetic handlers don't fall through
+    // to "forward upstream as svc_help".
+    if (tool.dispatch && (tool.dispatch.kind === "help" || tool.dispatch.kind === "run")) {
+      return await dispatchSyntheticCall(tool, dispatch, callArgs, { serviceCwd, serviceTimeout, serviceMaxBytes, serviceEnv });
+    }
+
     // mcp-stdio adapter: forward the call through the per-service MCP client
     // we set up at boot. No subprocess spawn here — the stdio MCP server is
     // already running, we just round-trip the JSON-RPC.
@@ -600,196 +806,13 @@ function createServer() {
       };
     }
 
-    // Synthetic "help" tool: run `<cli> [sub] --help [extra args]` and return
-    // raw text. This is the agent's primary way to discover what's available
-    // without burning output budget on broad enumeration tools.
-    //
-    // For mcp-stdio / mcp-http adapters, "help" is structurally different —
-    // we list every upstream tool name and input schema, since there's no
-    // `<cli> --help` binary to spawn against a URL.
-    if (tool.dispatch && tool.dispatch.kind === "help") {
-      const commandPath = Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0
-        ? callArgs.commandPath
-        : (typeof callArgs.sub === "string" && callArgs.sub ? [callArgs.sub] : []);
-      // Synthetic gateway-managed workspace help: when the agent asks for
-      // ["workspace"], return our text instead of forwarding to `<cli>
-      // workspace --help`. Workspace is read-only and lives entirely inside
-      // the gateway — there's no underlying CLI command to run.
-      if (commandPath.length === 1 && commandPath[0] === "workspace" && perServiceWorkspace[dispatch.serviceName]) {
-        return { content: [{ type: "text", text: workspaceHelpText() }] };
-      }
-      if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
-        const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
-        // For MCP adapters, build a synthetic help page from the aggregated
-        // tool list (when normal mode) or the synthetic _help/_run schema
-        // (when dual / triple). When normal, the upstream list is large;
-        // summarise tool names + schema.
-        const aggregatedForSvc = tools.filter(t => t.serviceName === serviceName);
-        const lines = [
-          `Help for MCP service "${serviceName}"${commandPathText}.`,
-            `Adapter: ${svc.adapter}.`,
-            `Tool mode: ${resolveToolMode(svc)}.`,
-            "",
-            "Available tools (use `<svc>_run` to invoke):",
-            ...aggregatedForSvc.map(t =>
-              `  - ${t.name}: ${(t.description || "").split(/\r?\n/)[0].slice(0, 160)}`,
-            ),
-          ];
-        let text = lines.join("\n");
-        if (text.length > serviceMaxBytes) {
-          text = text.slice(0, serviceMaxBytes) +
-            `\n\n[TRUNCATED: help was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
-        }
-        const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
-          ? "\n\n---\n\n" + workspaceHelpText()
-          : "";
-        return { content: [{ type: "text", text: text + workspaceSection }] };
-      }
-      const argv = [...(svc.args || [])];
-      if (commandPath.length > 0) argv.push(...commandPath);
-      argv.push("--help");
-      if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
-      const r = await execa(svc.command, argv, {
-        cwd: serviceCwd,
-        timeout: serviceTimeout,
-        reject: false,
-        env: serviceEnv,
-        extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
-      });
-      const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
-      let text = (r.stdout || r.stderr || "").trim()
-        || `(${svc.command}${commandPathText} --help produced no output)`;
-      // Help text is metadata: it should be discoverable but not exhaust
-      // the output budget. Cap it so an unhelpfully wide help panel cannot
-      // starve downstream tool results.
-      if (text.length > serviceMaxBytes) {
-        const hint = `\n\n[TRUNCATED: help was ${text.length} bytes, only first ${serviceMaxBytes} shown. Pass a narrower commandPath to see less.]`;
-        text = text.slice(0, serviceMaxBytes) + hint;
-      }
-      const target = `${svc.command}${commandPathText} --help`;
-      const header = [
-        `Help for ${svc.command}${commandPathText}.`,
-        `Use this meta-tool to inspect the CLI, or pass "commandPath" (preferred) or "sub" plus "args" to drill down into a command help page.`,
-        `Raw output from ${target}:`,
-      ].join("\n");
-      // Top-level help gets a "Managed workspace" section when workspace is
-      // active so the agent discovers the synthetic tool from help alone.
-      const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
-        ? "\n\n---\n\n" + workspaceHelpText()
-        : "";
-      return { content: [{ type: "text", text: `${header}\n\n${text}${workspaceSection}` }] };
-    }
-
-    // Synthetic "run" tool (dual-tool mode): execute `<cli> <commandPath...> <args...>`
-    // verbatim, no --help appended. Lets the agent reach nested subcommands that
-    // per-tool schema inference can't represent.
-    //
-    // For mcp-stdio / mcp-http adapters, the catalog was replaced by
-    // synthetic `_help` + `_run` tools under dual / triple mode. The run
-    // invocation forwards to the underlying MCP client using the first
-    // commandPath entry as the upstream tool name and `args` (array) as the
-    // tool arguments. This is the documented contract for synthetic `_run`
-    // over MCP adapters.
-    if (tool.dispatch && tool.dispatch.kind === "run") {
-      if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
-        const caller = perServiceCallers[dispatch.serviceName];
-        if (!caller) {
-          throw new Error(`MCP client missing for service ${dispatch.serviceName}`);
-        }
-        const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
-        const upstreamName = commandPath[0];
-        if (!upstreamName) {
-          return {
-            isError: true,
-            content: [{ type: "text", text: `${serviceName}_run requires commandPath=['<tool_name>'] for MCP adapters.` }],
-          };
-        }
-        // `args` may be either an object of named arguments (the typical MCP
-        // shape) or an array of positional strings (CLI-emulating callers).
-        const args = callArgs.args;
-        const result = await caller.callTool(upstreamName, args);
-        const blocks = result.content || [];
-        const textBlocks = blocks.filter(c => c.type === "text");
-        const otherBlocks = blocks.filter(c => c.type !== "text");
-        let text = textBlocks.map(c => c.text).join("\n");
-        if (text.length > serviceMaxBytes) {
-          text = text.slice(0, serviceMaxBytes) +
-            `\n\n[TRUNCATED: text output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
-        }
-        const outBlocks = text.length > 0 ? [{ type: "text", text }] : [];
-        outBlocks.push(...otherBlocks);
-        return {
-          content: outBlocks,
-          ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
-          isError: Boolean(result.isError),
-        };
-      }
-      const argv = [...(svc.args || [])];
-      const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
-      if (commandPath.length > 0) argv.push(...commandPath);
-      if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
-      const r = await execa(svc.command, argv, {
-        cwd: serviceCwd,
-        timeout: serviceTimeout,
-        reject: false,
-        env: serviceEnv,
-        extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
-        input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
-      });
-      if (r.exitCode !== 0) {
-        const errText = (r.stderr || r.stdout || "").trim();
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
-        };
-      }
-      // The run tool returns the *actual* tool result (e.g. a fetched image
-      // as base64, a downloaded report, a non-trivial analysis result). Truncating
-      // it here would silently break the consumer — for example, slicing a
-      // base64-encoded PNG corrupts the image. Skip the output-byte cap so
-      // callers receive the full stdout. Callers that need bounded payloads
-      // should ask the underlying tool to scope its output (e.g. paginate,
-      // limit, or stream).
-      const text = r.stdout || "";
-      // If the CLI side asked for `--output-format mcp` and emitted a single-
-      // line MCP envelope, forward it verbatim.  This is how image / audio /
-      // binary content blocks survive the dual_tool_mode round-trip without
-      // exposing all 200+ subcommands to the model.  A tool that doesn't
-      // opt into this mode falls through to the legacy text content path.
-      //
-      // The envelope is signalled by an "isMcpEnvelope": true marker placed
-      // in the last line.  We strip any leading lines (Typer boot banner,
-      // log output, etc.), parse the final JSON object, and use its
-      // `result.content` + `result.structuredContent` directly.
-      const lines = text.split(/\r?\n/);
-      let envelopeLine = null;
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        if (line.endsWith("}")) {
-          envelopeLine = line;
-          break;
-        }
-        // Bail as soon as we see a non-blank line that doesn't end with
-        // `}` — the envelope must be the last thing on stdout.
-        break;
-      }
-      if (envelopeLine && envelopeLine.includes('"isMcpEnvelope"') && envelopeLine.includes("true")) {
-        try {
-          const parsed = JSON.parse(envelopeLine);
-          const envResult = parsed.result || {};
-          return {
-            content: envResult.content || [],
-            ...(envResult.structuredContent !== undefined
-              ? { structuredContent: envResult.structuredContent }
-              : {}),
-            isError: Boolean(envResult.isError),
-          };
-        } catch {
-          // Fall through to text path on parse error.
-        }
-      }
-      return { content: [{ type: "text", text }] };
+    // Synthetic "help" / "run" dispatch lives in dispatchSyntheticCall below so
+    // the same handler covers CLI and MCP adapters — and crucially so the
+    // synthetic routes are evaluated BEFORE the mcp-stdio / mcp-http
+    // forwarding branch (an upstream tool named `<svc>_help` would otherwise
+    // shadow the synthetic one).
+    if (tool.dispatch && (tool.dispatch.kind === "help" || tool.dispatch.kind === "run")) {
+      return await dispatchSyntheticCall(tool, dispatch, callArgs, { serviceCwd, serviceTimeout, serviceMaxBytes, serviceEnv });
     }
 
     const argv = [...(svc.args || [])];
