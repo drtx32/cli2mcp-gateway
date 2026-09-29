@@ -118,6 +118,37 @@ const ServiceBase = z.object({
   env: z.record(z.string(), z.string()).optional(),
   timeout_ms: z.number().int().optional().default(60_000),
   max_output_bytes: z.number().int().optional().default(16_000),
+  // Explicit service-level tool exposure mode. Per ELI-398:
+  //   normal — existing recursive per-subcommand discovery + synthetic help
+  //            (auto-exposes synthetic workspace tool when workspace.path
+  //             is also configured under this service).
+  //   dual   — only `<cli>_help` and `<cli>_run` are exposed. Workspace is
+  //            ignored even if configured (preserves legacy dual_tool_mode
+  //            backwards compatibility).
+  //   triple — exactly `<cli>_help`, `<cli>_run`, and `workspace` are exposed.
+  //            workspace.path is REQUIRED.
+  // Explicit tool_mode wins over the legacy `dual_tool_mode` flag when both
+  // are set on the same service.
+  tool_mode: z.enum(["normal", "dual", "triple"]).optional(),
+  // Single-root read-only managed workspace. When `path` is set, the gateway
+  // exposes a synthetic `workspace` tool with subcommands dir / list / stat /
+  // read. The agent uses this to discover the canonical absolute workspace
+  // path so downstream CLIs can be told where to save files — without those
+  // CLIs needing to know about any CLI2MCP_* env var.
+  workspace: z.object({
+    // Path is resolved against the box.yaml directory (NOT process cwd),
+    // canonicalised, and created on boot if missing.
+    path: z.string().min(1),
+    max_total_bytes: z.number().int().optional(),
+    max_file_bytes: z.number().int().optional(),
+    max_files: z.number().int().optional(),
+    max_read_bytes: z.number().int().optional(),
+    max_list_entries: z.number().int().optional(),
+    ttl_seconds: z.number().int().optional(),
+    cleanup_policy: z.enum(["oldest_first", "largest_first", "none"]).optional(),
+    follow_symlinks: z.boolean().optional().default(false),
+    allow_hidden_files: z.boolean().optional().default(false),
+  }).optional(),
 });
 
 const ServiceSchema = z.discriminatedUnion("adapter", [
@@ -401,6 +432,12 @@ export function configSummary(box) {
     if (svc.adapter === "cli") detail += ` (${svc.command})`;
     if (svc.adapter === "mcp-http") detail += ` (${svc.url})`;
     if (svc.adapter === "openapi") detail += ` (${svc.base_url})`;
+    const mode = svc.tool_mode
+      ?? (svc.dual_tool_mode === true ? "dual" : "normal");
+    detail += ` [tool_mode=${mode}]`;
+    if (svc.workspace && (svc.tool_mode !== "dual")) {
+      detail += ` [workspace=${svc.workspace.path}]`;
+    }
     lines.push(`  - ${name}: ${detail}`);
   }
   return lines.join("\n");

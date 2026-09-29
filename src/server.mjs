@@ -34,6 +34,12 @@ import { aggregateTools, buildDispatchTable, resolveToolCall } from "./tool-aggr
 import { discoverStdioMcp, isStdioMcp } from "./adapters/mcp-stdio.mjs";
 import { discoverHttpMcp } from "./adapters/mcp-http.mjs";
 import { buildServiceEnv } from "./service-env.mjs";
+import {
+  resolveWorkspaceConfig,
+  workspaceToolSpec,
+  callWorkspace,
+  workspaceHelpText,
+} from "./workspace.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -304,6 +310,10 @@ if (env.STDIO_BOOT_TIMEOUT_SEC > 0) {
 const perServiceTools = {};
 /** @type {Record<string, { callTool: (name: string, args: any) => Promise<any>, close: () => Promise<void> }>} */
 const perServiceCallers = {};
+/** @type {Record<string, ReturnType<typeof resolveWorkspaceConfig>>} workspace runtime per service, or null if not active */
+const perServiceWorkspace = {};
+
+const boxConfigDir = box.path ? dirname(resolve(box.path)) : process.cwd();
 
 for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) {
   let svc = configuredSvc;
@@ -336,15 +346,25 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
     const subcmds = svc.subcommands && svc.subcommands.length > 0 ? svc.subcommands : null;
     // dual_tool_mode can be set on the service directly (preferred) or via
     // the legacy env-var path (which synthesises a single-service box).
+    // Triple mode implies dual-mode tool exposure (only `_help` + `_run`),
+    // since per-subcommand recursive tools would explode the third-tool set
+    // beyond the documented `help + run + workspace` triplet.
     let dualMode = false;
     let skipRec = false;
-    if (typeof svc.dual_tool_mode === "boolean") {
+    if (svc.tool_mode === "triple") {
+      dualMode = true;
+    } else if (typeof svc.dual_tool_mode === "boolean") {
       dualMode = svc.dual_tool_mode;
     } else if (svc.__legacy && typeof svc.__legacy.CLI_DUAL_TOOL_MODE === "boolean") {
       dualMode = svc.__legacy.CLI_DUAL_TOOL_MODE;
     }
     if (typeof svc.skip_recursive === "boolean") {
       skipRec = svc.skip_recursive;
+    }
+    if (svc.tool_mode === "triple") {
+      // Triple mode = dual mode + workspace tool. Don't skip-recursive walk
+      // — synthetic run can still hit nested subcommands via commandPath.
+      skipRec = false;
     }
     perServiceTools[serviceName] = await discoverTools(
       svc.command,
@@ -387,6 +407,25 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
     console.error(`[boot] adapter "${svc.adapter}" not yet implemented (service: ${serviceName})`);
     process.exit(1);
   }
+
+  // Resolve the managed workspace for this service AFTER discovery so we can
+  // attach the synthetic workspace tool (when active) onto the per-service
+  // catalog. Triple mode requires workspace.path; the resolver throws a
+  // clear boot-time error when it's missing — we catch it and exit so the
+  // operator sees the actionable error before any traffic flows.
+  let workspaceRuntime = null;
+  try {
+    workspaceRuntime = resolveWorkspaceConfig(svc.workspace, boxConfigDir, svc);
+  } catch (err) {
+    console.error(`[boot] ${serviceName}: ${err.message}`);
+    process.exit(1);
+  }
+  if (workspaceRuntime) {
+    perServiceTools[serviceName].push(workspaceToolSpec());
+    console.error(`[boot] ${serviceName}: workspace active at ${workspaceRuntime.root}` +
+      ` (tool_mode=${workspaceRuntime.toolMode})`);
+  }
+  perServiceWorkspace[serviceName] = workspaceRuntime;
 }
 if (bootTimeoutHandle) clearTimeout(bootTimeoutHandle);
 
@@ -470,6 +509,13 @@ function createServer() {
       const commandPath = Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0
         ? callArgs.commandPath
         : (typeof callArgs.sub === "string" && callArgs.sub ? [callArgs.sub] : []);
+      // Synthetic gateway-managed workspace help: when the agent asks for
+      // ["workspace"], return our text instead of forwarding to `<cli>
+      // workspace --help`. Workspace is read-only and lives entirely inside
+      // the gateway — there's no underlying CLI command to run.
+      if (commandPath.length === 1 && commandPath[0] === "workspace" && perServiceWorkspace[dispatch.serviceName]) {
+        return { content: [{ type: "text", text: workspaceHelpText() }] };
+      }
       if (commandPath.length > 0) argv.push(...commandPath);
       argv.push("--help");
       if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
@@ -496,7 +542,12 @@ function createServer() {
         `Use this meta-tool to inspect the CLI, or pass "commandPath" (preferred) or "sub" plus "args" to drill down into a command help page.`,
         `Raw output from ${target}:`,
       ].join("\n");
-      return { content: [{ type: "text", text: `${header}\n\n${text}` }] };
+      // Top-level help gets a "Managed workspace" section when workspace is
+      // active so the agent discovers the synthetic tool from help alone.
+      const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
+        ? "\n\n---\n\n" + workspaceHelpText()
+        : "";
+      return { content: [{ type: "text", text: `${header}\n\n${text}${workspaceSection}` }] };
     }
 
     // Synthetic "run" tool (dual-tool mode): execute `<cli> <commandPath...> <args...>`
@@ -569,6 +620,30 @@ function createServer() {
         }
       }
       return { content: [{ type: "text", text }] };
+    }
+
+    // Synthetic "workspace" tool: read-only managed workspace. Returns a
+    // JSON-serialisable result envelope (dir / list / stat) directly, or an
+    // MCP content array (read with image blocks for PNG / JPEG / etc.). The
+    // workspace runtime was resolved at boot per-service; if it's null here,
+    // it means workspace is not active and the synthetic spec wouldn't be exposed
+    // — any caller that managed to reach this branch is a server bug.
+    if (tool.dispatch && tool.dispatch.kind === "workspace") {
+      const runtime = perServiceWorkspace[dispatch.serviceName];
+      if (!runtime) {
+        throw new Error(
+          `workspace tool dispatched for service "${dispatch.serviceName}" ` +
+          `but workspace runtime is not active — server bug.`,
+        );
+      }
+      const result = await callWorkspace(runtime, callArgs);
+      // `dir` / `list` / `stat` return plain objects — wrap them in text
+      // so the MCP response is well-formed. `read` returns a content array
+      // directly.
+      if (Array.isArray(result?.content)) {
+        return result;
+      }
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
     }
 
     const argv = [...(svc.args || [])];
