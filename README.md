@@ -194,7 +194,7 @@ For multiple upstreams, use a `box.yaml` file. The gateway supports these
 inbound adapters:
 
 - `cli` — a non-MCP CLI. The gateway can expose `help + run`
-  (`dual_tool_mode: true`) or `help + recursively discovered leaf commands`
+  (`tool_mode: dual`) or `help + recursively discovered leaf commands`
   (the default).
 - `mcp-stdio` — an MCP server launched as a stdio child process. For a CLI
   whose MCP entry point is a subcommand, put that subcommand in `args`, for
@@ -205,6 +205,51 @@ inbound adapters:
 - `auto` — probe the command as MCP stdio first (including a conventional
   `mcp` subcommand), then fall back to the help-driven `cli` adapter.
 
+### Tool exposure mode (`tool_mode`)
+
+Each `cli` / `auto` / `mcp-stdio` / `mcp-http` service can declare how the
+gateway exposes it. Pick one:
+
+| `tool_mode`  | Tools exposed                                                                                  | `workspace.path` |
+|--------------|----------------------------------------------------------------------------------------------|------------------|
+| `normal`     | All recursively-discovered leaf tools + synthetic `help`. Optionally adds `workspace` if `workspace.path` is set. | optional        |
+| `dual`       | Only `<cli>_help` and `<cli>_run`. `workspace.path` is **ignored** even if configured.       | ignored          |
+| `triple`     | Exactly `<cli>_help`, `<cli>_run`, and `workspace`. `workspace.path` is **required** — boot fails with a clear error otherwise. | required        |
+
+Legacy `dual_tool_mode: true` still works and is equivalent to
+`tool_mode: dual`. When both flags are present, the explicit `tool_mode`
+wins.
+
+### Managed workspace
+
+When `workspace.path` is configured and `tool_mode` is not `dual`, the
+gateway exposes a synthetic `workspace` tool that gives the agent
+read-only access to a single canonical absolute directory. Subcommands:
+
+- `workspace(subcommand="dir")` — returns the canonical absolute path so
+  the agent can pass it directly to downstream CLI flags like
+  `--output`, `-o`, `--save`.
+- `workspace(subcommand="list", path?, recursive?)` — bounded recursive
+  listing. `max_list_entries` caps the result.
+- `workspace(subcommand="stat", path)` — metadata for one entry.
+- `workspace(subcommand="read", path)` — returns the file as a typed MCP
+  content block: image content for PNG / JPEG / GIF / WebP, text content
+  for UTF-8 / JSON / markdown / etc., and a structured error for anything
+  binary or oversized.
+
+The workspace is strictly read-only: no write / delete / move / copy /
+execute support, and the gateway never fetches URLs into the workspace.
+`..`, absolute paths outside the configured root, symlinks that resolve
+outside the root, and hidden files (leading `.`) are all rejected with a
+clear actionable error before any read. `follow_symlinks` defaults to
+`false`; when set to `true`, every descent still verifies containment.
+`max_read_bytes` enforces a hard cap on file reads — the gateway never
+silently truncates file content.
+
+Relative paths in `workspace.path` resolve against the directory holding
+`box.yaml`, not against process `cwd`. The directory is auto-created at
+boot if missing.
+
 Example:
 
 ```yaml
@@ -213,7 +258,13 @@ services:
   local_cli:
     adapter: cli
     command: my-cli
-    dual_tool_mode: false
+    tool_mode: triple
+    workspace:
+      path: ./workspace-local
+      max_read_bytes: 16777216
+      max_list_entries: 200
+      follow_symlinks: false
+      allow_hidden_files: false
   pure_mcp:
     adapter: mcp-stdio
     command: npx
@@ -229,6 +280,12 @@ transport:
   host: 127.0.0.1
   port: 3100
 ```
+
+In `triple` mode the agent sees three tools: `local_cli_help`, `local_cli_run`,
+and `workspace`. The agent is expected to call `workspace(subcommand="dir")`
+to discover the canonical absolute workspace root, and then pass it to the
+downstream CLI's output / save flags. The downstream CLI does not need to
+read any `CLI2MCP_*` environment variable.
 
 ### Local runtime management
 
@@ -321,16 +378,23 @@ Wrapping a CLI as an MCP tool has its own set of pain points beyond what the raw
 ```
 cli2mcp-gateway/
 ├── src/
-│   ├── server.mjs      # dual-transport entry + HTTP server
-│   └── help-parser.js  # argparse-style --help → JSON Schema inference
-├── .env.example        # configuration template
+│   ├── server.mjs          # dual-transport entry + HTTP server
+│   ├── box-config.mjs      # YAML box loader + zod schema
+│   ├── tool-aggregator.mjs # per-service → flat tool list merger
+│   ├── workspace.mjs       # managed single-root read-only workspace runtime
+│   ├── help-parser.js      # argparse-style --help → JSON Schema inference
+│   ├── service-env.mjs     # per-service env merging (strips task tokens)
+│   └── adapters/           # mcp-stdio / mcp-http upstream adapters
+├── test/                    # node --test specs
+├── test-fixtures/          # stub MCP servers for e2e tests
+├── .env.example
 ├── .gitignore
 ├── package.json
 ├── README.md
 └── LICENSE
 ```
 
-The CLI runs in whatever directory you point it at via `CLI_CWD` — no `sandbox/` is created by default. Create that path yourself if you want a sandboxed workspace.
+The CLI runs in whatever directory you point it at via `CLI_CWD` — no `sandbox/` is created by default. Create that path yourself if you want a sandboxed workspace. For multi-service `box.yaml` deployments, configure a `workspace.path` per service instead — see [Managed workspace](#managed-workspace).
 
 ---
 
