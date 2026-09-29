@@ -218,9 +218,15 @@ test("symlink escape: a symlink that resolves outside the root is rejected", () 
 
   mkdirSync(resolve(boxDir, "d"));
   // Symlink d/escape → outsideDir. Resolving d/escape → outsideDir which is
-  // outside d → must be rejected.
+  // outside d → must be rejected. This test opts into follow_symlinks=true
+  // so we exercise the containment check (default follow_symlinks=false
+  // would reject ANY symlink before containment even gets a chance).
   symlinkSync(outsideDir, resolve(boxDir, "d", "escape"), "dir");
-  const runtime = resolveWorkspaceConfig({ path: "./d" }, boxDir, { tool_mode: "normal" });
+  const runtime = resolveWorkspaceConfig(
+    { path: "./d", follow_symlinks: true },
+    boxDir,
+    { tool_mode: "normal" },
+  );
   assert.throws(
     () => canonicaliseInsideRoot("escape/outside.txt", runtime),
     /escapes workspace root/,
@@ -233,11 +239,46 @@ test("symlink escape: a file symlink that points outside the root is rejected", 
   writeFile(outsideFile, "outside");
   mkdirSync(resolve(boxDir, "d"));
   symlinkSync(outsideFile, resolve(boxDir, "d", "badlink"));
-  const runtime = resolveWorkspaceConfig({ path: "./d" }, boxDir, { tool_mode: "normal" });
+  const runtime = resolveWorkspaceConfig(
+    { path: "./d", follow_symlinks: true },
+    boxDir,
+    { tool_mode: "normal" },
+  );
   assert.throws(
     () => canonicaliseInsideRoot("badlink", runtime),
     /escapes workspace root/,
   );
+});
+
+test("follow_symlinks=false (default): in-root symlink is rejected before any read", () => {
+  // Even when the symlink target is INSIDE the workspace root, follow_symlinks=false
+  // must reject the path so the operator's "no symlink" policy is honored. This is
+  // the regression test for Finding 4 — current main resolves through the symlink.
+  const boxDir = mkRoot();
+  mkdirSync(resolve(boxDir, "d", "real"), { recursive: true });
+  writeFile(resolve(boxDir, "d", "real", "inside.txt"), "inside");
+  symlinkSync(resolve(boxDir, "d", "real"), resolve(boxDir, "d", "link"), "dir");
+  const runtime = resolveWorkspaceConfig({ path: "./d" }, boxDir, { tool_mode: "normal" });
+  assert.throws(
+    () => canonicaliseInsideRoot("link/inside.txt", runtime),
+    /traverses a symlink/,
+  );
+});
+
+test("follow_symlinks=true: in-root symlink resolves and reads succeed", () => {
+  // Opt-in case: with follow_symlinks=true, an in-root symlink is allowed and
+  // reads go through to the real file.
+  const boxDir = mkRoot();
+  mkdirSync(resolve(boxDir, "d", "real"), { recursive: true });
+  writeFile(resolve(boxDir, "d", "real", "inside.txt"), "inside");
+  symlinkSync(resolve(boxDir, "d", "real"), resolve(boxDir, "d", "link"), "dir");
+  const runtime = resolveWorkspaceConfig(
+    { path: "./d", follow_symlinks: true },
+    boxDir,
+    { tool_mode: "normal" },
+  );
+  const canonical = canonicaliseInsideRoot("link/inside.txt", runtime);
+  assert.equal(canonical, resolve(boxDir, "d", "real", "inside.txt"));
 });
 
 // ---------- hidden files ----------

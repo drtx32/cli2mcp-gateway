@@ -36,6 +36,7 @@ import { discoverHttpMcp } from "./adapters/mcp-http.mjs";
 import { buildServiceEnv } from "./service-env.mjs";
 import {
   resolveWorkspaceConfig,
+  resolveToolMode,
   workspaceToolSpec,
   callWorkspace,
   workspaceHelpText,
@@ -315,6 +316,79 @@ const perServiceWorkspace = {};
 
 const boxConfigDir = box.path ? dirname(resolve(box.path)) : process.cwd();
 
+/**
+ * Build the synthetic `<svc>_help` and `<svc>_run` tool specs. Shape mirrors
+ * what help-parser.js emits for `dualToolMode=true`, so server.mjs's call
+ * dispatcher can route either path with the same code path.
+ *
+ * Used when an adapter doesn't natively produce help/run tools but the
+ * service is in dual or triple mode. Today that's mcp-stdio and mcp-http.
+ */
+function syntheticHelpRunSpecs(serviceName) {
+  return [
+    {
+      name: `${serviceName}_help`,
+      description:
+        `Gateway meta-tool: inspect the wrapped MCP service "${serviceName}". ` +
+        `Call with commandPath=["workspace"] to see gateway-managed workspace help, ` +
+        `or pass any sub-path to forward a help-style probe to the underlying service.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          commandPath: {
+            type: "array",
+            items: { type: "string" },
+            description: "Preferred: full command path to drill into.",
+          },
+          sub: { type: "string", description: "Legacy alias for a single subcommand name. Prefer commandPath." },
+          args: { type: "array", items: { type: "string" }, description: "Extra args forwarded verbatim." },
+        },
+        additionalProperties: false,
+      },
+      dispatch: { kind: "help" },
+    },
+    {
+      name: `${serviceName}_run`,
+      description:
+        `Gateway meta-tool: invoke a tool on the wrapped MCP service "${serviceName}" ` +
+        `by name. commandPath is forwarded as the underlying tool name; args become the ` +
+        `tool arguments. Use this when you need to reach a tool that isn't exposed as ` +
+        `a top-level MCP tool (e.g. tool_mode=dual / triple mode).`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          commandPath: {
+            type: "array",
+            items: { type: "string" },
+            description: "Tool name (one-element array), e.g. ['list_things'].",
+          },
+          args: {
+            type: "array",
+            items: { type: "string" },
+            description: "Args forwarded verbatim as the tool's input.",
+          },
+          stdin: { type: "string", description: "Optional: piped into the tool's stdin." },
+        },
+        additionalProperties: false,
+      },
+      dispatch: { kind: "run" },
+    },
+  ];
+}
+
+/**
+ * Apply the configured tool_mode to an mcp-stdio / mcp-http catalog.
+ *  - normal: keep every upstream tool as-is.
+ *  - dual:   replace the catalog with `<svc>_help` + `<svc>_run`.
+ *  - triple: replace the catalog with `<svc>_help` + `<svc>_run` (workspace
+ *            is appended separately by the boot loop).
+ * Returns the new per-service tool array.
+ */
+function applyToolModeToMcpCatalog(tools, svc, toolMode, serviceName) {
+  if (toolMode === "normal") return tools;
+  return syntheticHelpRunSpecs(serviceName);
+}
+
 for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) {
   let svc = configuredSvc;
   if (svc.adapter === "auto") {
@@ -344,24 +418,19 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
   }
   if (svc.adapter === "cli") {
     const subcmds = svc.subcommands && svc.subcommands.length > 0 ? svc.subcommands : null;
-    // dual_tool_mode can be set on the service directly (preferred) or via
-    // the legacy env-var path (which synthesises a single-service box).
-    // Triple mode implies dual-mode tool exposure (only `_help` + `_run`),
-    // since per-subcommand recursive tools would explode the third-tool set
-    // beyond the documented `help + run + workspace` triplet.
-    let dualMode = false;
+    // Single source of truth for tool_mode resolution: explicit tool_mode
+    // (normal | dual | triple) wins; legacy dual_tool_mode=true ⇒ dual;
+    // otherwise normal. Triple mode implies dual-mode tool exposure (only
+    // `_help` + `_run`), since per-subcommand recursive tools would explode
+    // the third-tool set beyond the documented `help + run + workspace`
+    // triplet.
+    const toolMode = resolveToolMode(svc);
+    let dualMode = toolMode === "dual" || toolMode === "triple";
     let skipRec = false;
-    if (svc.tool_mode === "triple") {
-      dualMode = true;
-    } else if (typeof svc.dual_tool_mode === "boolean") {
-      dualMode = svc.dual_tool_mode;
-    } else if (svc.__legacy && typeof svc.__legacy.CLI_DUAL_TOOL_MODE === "boolean") {
-      dualMode = svc.__legacy.CLI_DUAL_TOOL_MODE;
-    }
     if (typeof svc.skip_recursive === "boolean") {
       skipRec = svc.skip_recursive;
     }
-    if (svc.tool_mode === "triple") {
+    if (toolMode === "triple") {
       // Triple mode = dual mode + workspace tool. Don't skip-recursive walk
       // — synthetic run can still hit nested subcommands via commandPath.
       skipRec = false;
@@ -386,7 +455,8 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
       env: svc.env || {},
       cwd: svc.cwd,
     });
-    perServiceTools[serviceName] = tools;
+    const mcpToolMode = resolveToolMode(svc);
+    perServiceTools[serviceName] = applyToolModeToMcpCatalog(tools, svc, mcpToolMode, serviceName);
     perServiceCallers[serviceName] = {
       callTool: (name, args) => client.callTool({ name, arguments: args ?? {} }),
       close,
@@ -398,7 +468,8 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
       headers: svc.headers || {},
       auth: svc.auth || {},
     });
-    perServiceTools[serviceName] = tools;
+    const mcpToolMode = resolveToolMode(svc);
+    perServiceTools[serviceName] = applyToolModeToMcpCatalog(tools, svc, mcpToolMode, serviceName);
     perServiceCallers[serviceName] = {
       callTool: (name, args) => client.callTool({ name, arguments: args ?? {} }),
       close,
@@ -469,6 +540,34 @@ function createServer() {
     const serviceMaxBytes = svc.max_output_bytes || env.CLI_MAX_OUTPUT_BYTES;
     const serviceEnv = buildServiceEnv(process.env, svc.env || {});
 
+    // Synthetic "workspace" tool: read-only managed workspace. Returns a
+    // JSON-serialisable result envelope (dir / list / stat) directly, or an
+    // MCP content array (read with image blocks for PNG / JPEG / etc.). The
+    // workspace runtime was resolved at boot per-service; if it's null here,
+    // it means workspace is not active and the synthetic spec wouldn't be exposed
+    // — any caller that managed to reach this branch is a server bug.
+    //
+    // Intercept BEFORE the mcp-stdio/mcp-http forwarding branch so an
+    // upstream MCP that happens to expose its own tool called `workspace`
+    // cannot shadow the gateway's local synthetic one.
+    if (tool.dispatch && tool.dispatch.kind === "workspace") {
+      const runtime = perServiceWorkspace[dispatch.serviceName];
+      if (!runtime) {
+        throw new Error(
+          `workspace tool dispatched for service "${dispatch.serviceName}" ` +
+          `but workspace runtime is not active — server bug.`,
+        );
+      }
+      const result = await callWorkspace(runtime, callArgs);
+      // `dir` / `list` / `stat` return plain objects — wrap them in text
+      // so the MCP response is well-formed. `read` returns a content array
+      // directly.
+      if (Array.isArray(result?.content)) {
+        return result;
+      }
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    }
+
     // mcp-stdio adapter: forward the call through the per-service MCP client
     // we set up at boot. No subprocess spawn here — the stdio MCP server is
     // already running, we just round-trip the JSON-RPC.
@@ -504,8 +603,11 @@ function createServer() {
     // Synthetic "help" tool: run `<cli> [sub] --help [extra args]` and return
     // raw text. This is the agent's primary way to discover what's available
     // without burning output budget on broad enumeration tools.
+    //
+    // For mcp-stdio / mcp-http adapters, "help" is structurally different —
+    // we list every upstream tool name and input schema, since there's no
+    // `<cli> --help` binary to spawn against a URL.
     if (tool.dispatch && tool.dispatch.kind === "help") {
-      const argv = [...(svc.args || [])];
       const commandPath = Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0
         ? callArgs.commandPath
         : (typeof callArgs.sub === "string" && callArgs.sub ? [callArgs.sub] : []);
@@ -516,6 +618,34 @@ function createServer() {
       if (commandPath.length === 1 && commandPath[0] === "workspace" && perServiceWorkspace[dispatch.serviceName]) {
         return { content: [{ type: "text", text: workspaceHelpText() }] };
       }
+      if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
+        const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
+        // For MCP adapters, build a synthetic help page from the aggregated
+        // tool list (when normal mode) or the synthetic _help/_run schema
+        // (when dual / triple). When normal, the upstream list is large;
+        // summarise tool names + schema.
+        const aggregatedForSvc = tools.filter(t => t.serviceName === serviceName);
+        const lines = [
+          `Help for MCP service "${serviceName}"${commandPathText}.`,
+            `Adapter: ${svc.adapter}.`,
+            `Tool mode: ${resolveToolMode(svc)}.`,
+            "",
+            "Available tools (use `<svc>_run` to invoke):",
+            ...aggregatedForSvc.map(t =>
+              `  - ${t.name}: ${(t.description || "").split(/\r?\n/)[0].slice(0, 160)}`,
+            ),
+          ];
+        let text = lines.join("\n");
+        if (text.length > serviceMaxBytes) {
+          text = text.slice(0, serviceMaxBytes) +
+            `\n\n[TRUNCATED: help was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
+        }
+        const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
+          ? "\n\n---\n\n" + workspaceHelpText()
+          : "";
+        return { content: [{ type: "text", text: text + workspaceSection }] };
+      }
+      const argv = [...(svc.args || [])];
       if (commandPath.length > 0) argv.push(...commandPath);
       argv.push("--help");
       if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
@@ -553,7 +683,47 @@ function createServer() {
     // Synthetic "run" tool (dual-tool mode): execute `<cli> <commandPath...> <args...>`
     // verbatim, no --help appended. Lets the agent reach nested subcommands that
     // per-tool schema inference can't represent.
+    //
+    // For mcp-stdio / mcp-http adapters, the catalog was replaced by
+    // synthetic `_help` + `_run` tools under dual / triple mode. The run
+    // invocation forwards to the underlying MCP client using the first
+    // commandPath entry as the upstream tool name and `args` (array) as the
+    // tool arguments. This is the documented contract for synthetic `_run`
+    // over MCP adapters.
     if (tool.dispatch && tool.dispatch.kind === "run") {
+      if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
+        const caller = perServiceCallers[dispatch.serviceName];
+        if (!caller) {
+          throw new Error(`MCP client missing for service ${dispatch.serviceName}`);
+        }
+        const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
+        const upstreamName = commandPath[0];
+        if (!upstreamName) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `${serviceName}_run requires commandPath=['<tool_name>'] for MCP adapters.` }],
+          };
+        }
+        // `args` may be either an object of named arguments (the typical MCP
+        // shape) or an array of positional strings (CLI-emulating callers).
+        const args = callArgs.args;
+        const result = await caller.callTool(upstreamName, args);
+        const blocks = result.content || [];
+        const textBlocks = blocks.filter(c => c.type === "text");
+        const otherBlocks = blocks.filter(c => c.type !== "text");
+        let text = textBlocks.map(c => c.text).join("\n");
+        if (text.length > serviceMaxBytes) {
+          text = text.slice(0, serviceMaxBytes) +
+            `\n\n[TRUNCATED: text output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
+        }
+        const outBlocks = text.length > 0 ? [{ type: "text", text }] : [];
+        outBlocks.push(...otherBlocks);
+        return {
+          content: outBlocks,
+          ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
+          isError: Boolean(result.isError),
+        };
+      }
       const argv = [...(svc.args || [])];
       const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
       if (commandPath.length > 0) argv.push(...commandPath);
@@ -620,30 +790,6 @@ function createServer() {
         }
       }
       return { content: [{ type: "text", text }] };
-    }
-
-    // Synthetic "workspace" tool: read-only managed workspace. Returns a
-    // JSON-serialisable result envelope (dir / list / stat) directly, or an
-    // MCP content array (read with image blocks for PNG / JPEG / etc.). The
-    // workspace runtime was resolved at boot per-service; if it's null here,
-    // it means workspace is not active and the synthetic spec wouldn't be exposed
-    // — any caller that managed to reach this branch is a server bug.
-    if (tool.dispatch && tool.dispatch.kind === "workspace") {
-      const runtime = perServiceWorkspace[dispatch.serviceName];
-      if (!runtime) {
-        throw new Error(
-          `workspace tool dispatched for service "${dispatch.serviceName}" ` +
-          `but workspace runtime is not active — server bug.`,
-        );
-      }
-      const result = await callWorkspace(runtime, callArgs);
-      // `dir` / `list` / `stat` return plain objects — wrap them in text
-      // so the MCP response is well-formed. `read` returns a content array
-      // directly.
-      if (Array.isArray(result?.content)) {
-        return result;
-      }
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
     }
 
     const argv = [...(svc.args || [])];
