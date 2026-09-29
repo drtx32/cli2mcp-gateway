@@ -329,17 +329,29 @@ const CLEANUP_POLICIES = new Set(["oldest_first", "largest_first", "none"]);
  * @returns {Promise<{deleted: number, bytesReclaimed: number}>}
  */
 export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
-  if (!runtime.root) return { deleted: 0, bytesReclaimed: 0 };
+  if (!runtime.root) return { deleted: 0, bytesReclaimed: 0, permissionErrors: [] };
   // Collect every file under the root. We use lstat so symlinks aren't
   // followed into the budget — a symlink to a 1GB file shouldn't push us
   // over quota, and we don't have a sane way to delete the target anyway.
   const all = [];
+  const permissionErrors = [];
   const stack = ["."];
   while (stack.length > 0) {
     const rel = stack.pop();
     const abs = rel === "." ? runtime.root : `${runtime.root}${sep}${rel}`;
     let ents;
-    try { ents = await readdir(abs, { withFileTypes: true }); } catch { continue; }
+    try {
+      ents = await readdir(abs, { withFileTypes: true });
+    } catch (err) {
+      if (err?.code === "EACCES" || err?.code === "EPERM") {
+        permissionErrors.push({
+          rel: rel === "." ? "." : rel,
+          code: err.code,
+          message: err.message,
+        });
+      }
+      continue;
+    }
     for (const ent of ents) {
       // Visibility policy (allow_hidden_files) only affects what the agent
       // sees via list/read/stat — NOT what counts against disk quota. A
@@ -396,6 +408,7 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
       return enforceQuotas(runtime, { now }).then(r => ({
         deleted: r.deleted + deleted,
         bytesReclaimed: r.bytesReclaimed + bytesReclaimed,
+        permissionErrors: [...permissionErrors, ...r.permissionErrors],
       }));
     }
   }
@@ -438,7 +451,7 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
       } catch {}
     }
   }
-  return { deleted, bytesReclaimed };
+  return { deleted, bytesReclaimed, permissionErrors };
 }
 
 /**
@@ -454,13 +467,24 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
  * silently inflate the workspace beyond the configured budget.
  */
 export async function quotaStats(runtime) {
-  const result = { files: 0, totalBytes: 0, maxFiles: runtime.maxFiles, maxTotalBytes: runtime.maxTotalBytes, ttlSeconds: runtime.ttlSeconds, cleanupPolicy: runtime.cleanupPolicy };
+  const result = { files: 0, totalBytes: 0, maxFiles: runtime.maxFiles, maxTotalBytes: runtime.maxTotalBytes, ttlSeconds: runtime.ttlSeconds, cleanupPolicy: runtime.cleanupPolicy, permissionErrors: [] };
   if (!runtime.root) return result;
   const stack = [runtime.root];
   while (stack.length > 0) {
     const abs = stack.pop();
     let ents;
-    try { ents = await readdir(abs, { withFileTypes: true }); } catch { continue; }
+    try {
+      ents = await readdir(abs, { withFileTypes: true });
+    } catch (err) {
+      if (err?.code === "EACCES" || err?.code === "EPERM") {
+        result.permissionErrors.push({
+          rel: relative(runtime.root, abs) || ".",
+          code: err.code,
+          message: err.message,
+        });
+      }
+      continue;
+    }
     for (const ent of ents) {
       const childAbs = `${abs}${sep}${ent.name}`;
       let st;
@@ -493,8 +517,12 @@ export async function quotaStats(runtime) {
  * state, not the pre-call state.
  */
 export async function opDir(runtime) {
-  await enforceQuotas(runtime);
+  const enforcement = await enforceQuotas(runtime);
   const quotas = await quotaStats(runtime);
+  quotas.permissionErrors = [
+    ...enforcement.permissionErrors,
+    ...quotas.permissionErrors,
+  ];
   return { root: runtime.root, quotas };
 }
 

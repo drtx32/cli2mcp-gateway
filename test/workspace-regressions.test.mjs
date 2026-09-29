@@ -28,6 +28,7 @@ import {
   existsSync,
   utimesSync,
   symlinkSync,
+  readFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -344,33 +345,23 @@ test("R2-1: synthetic MCP _help and _run carry distinct dispatch.kind tags", () 
   assert.notEqual(runSpec.dispatch.kind, "workspace");
 });
 
-// R2-Finding 2 (P1): synthetic MCP `_run` advertises `args` as either an
-// object of named parameters (typical MCP shape, e.g. {text: "hello"}) OR
-// an array of positional strings (CLI-emulating callers). The previous
-// schema only permitted array-of-strings, which made it impossible for
-// schema-following MCP clients to construct valid calls.
+// R2-Finding 2 / R5-3: MCP `_run` accepts only an object. CLI `_run` may
+// still accept positional arrays, but MCP tools/call arguments are objects.
 
-test("R2-2: synthetic _run args schema accepts both object and array shapes", () => {
+test("R2-2: MCP synthetic _run args schema is object-only", () => {
   // Re-implement the schema shape inline (server.mjs owns the helper).
   const schema = {
     type: "object",
     properties: {
       commandPath: { type: "array", items: { type: "string" } },
       args: {
-        description: "Args forwarded to upstream tool.",
-        oneOf: [
-          { type: "object", additionalProperties: true },
-          { type: "array", items: { type: "string" } },
-        ],
+        type: "object",
+        additionalProperties: true,
       },
     },
   };
-  const allowed = schema.properties.args.oneOf;
-  assert.equal(allowed.length, 2);
-  const objectSchema = allowed.find(s => s.type === "object");
-  const arraySchema = allowed.find(s => s.type === "array");
-  assert.ok(objectSchema, "args schema must permit object (MCP) shape");
-  assert.ok(arraySchema, "args schema must permit array (CLI) shape");
+  const objectSchema = schema.properties.args;
+  assert.equal(objectSchema.type, "object");
   assert.equal(objectSchema.additionalProperties, true,
     "args object schema must allow arbitrary named params so any upstream tool signature works");
 });
@@ -675,4 +666,37 @@ test("resolveWorkspaceConfig rejects a configured file as the workspace root", (
       /not a directory/,
     );
   } finally { cleanup(boxDir); }
+});
+
+// R5-1: synthetic MCP help must expose the upstream schema at a selected
+// tool, while root help stays compact enough for large catalogs.
+test("R5-1: synthetic MCP help renders deep schemas and root argument summaries", () => {
+  const source = readFileSync(resolve(import.meta.dirname, "../src/server.mjs"), "utf8");
+  assert.match(source, /JSON\.stringify\(selected\.inputSchema \|\| \{\}, null, 2\)/);
+  assert.match(source, /required\.join\(\", \"\)/);
+  assert.match(source, /properties\.join\(\", \"\)/);
+  assert.match(source, /\[TRUNCATED: help was/);
+});
+
+test("R5-1b: root synthetic MCP help includes props and required labels", () => {
+  const source = readFileSync(resolve(import.meta.dirname, "../src/server.mjs"), "utf8");
+  assert.match(source, /`props: \$\{properties\.join\(\", \"\)\}`/);
+  assert.match(source, /`required: \$\{required\.join\(\", \"\)\}`/);
+});
+
+// R5-2: permission failures during quota walks must be observable rather
+// than treated as an empty subtree. This source-level regression complements
+// the filesystem test used by the supervisor on a non-root runner (root can
+// read mode-000 directories, so chmod-based EACCES is not reproducible here).
+test("R5-2: quota walks surface permissionErrors for unreadable subtrees", () => {
+  const source = readFileSync(resolve(import.meta.dirname, "../src/workspace.mjs"), "utf8");
+  assert.match(source, /permissionErrors\.push\(\{/);
+  assert.match(source, /err\?\.code === "EACCES" \|\| err\?\.code === "EPERM"/);
+  assert.match(source, /quotas\.permissionErrors = \[/);
+});
+
+test("R5-3: MCP _run rejects array args instead of forwarding them", () => {
+  const source = readFileSync(resolve(import.meta.dirname, "../src/server.mjs"), "utf8");
+  assert.match(source, /adapter === "mcp-stdio" \|\| adapter === "mcp-http"/);
+  assert.match(source, /Invalid args for MCP adapter: expected object, received array/);
 });

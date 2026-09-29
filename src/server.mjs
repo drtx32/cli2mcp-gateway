@@ -325,7 +325,20 @@ const boxConfigDir = box.path ? dirname(resolve(box.path)) : process.cwd();
  * Used when an adapter doesn't natively produce help/run tools but the
  * service is in dual or triple mode. Today that's mcp-stdio and mcp-http.
  */
-function syntheticHelpRunSpecs(serviceName) {
+function syntheticHelpRunSpecs(serviceName, adapter = "cli") {
+  const runArgsSchema = adapter === "mcp-stdio" || adapter === "mcp-http"
+    ? {
+        type: "object",
+        additionalProperties: true,
+        description: "Named arguments forwarded to the upstream MCP tool.",
+      }
+    : {
+        oneOf: [
+          { type: "object", additionalProperties: true },
+          { type: "array", items: { type: "string" } },
+        ],
+        description: "Named arguments or positional strings forwarded to the CLI.",
+      };
   return [
     {
       name: `${serviceName}_help`,
@@ -363,18 +376,7 @@ function syntheticHelpRunSpecs(serviceName) {
             items: { type: "string" },
             description: "Tool name (one-element array), e.g. ['list_things'].",
           },
-          // MCP tools typically accept an object of named arguments (e.g.
-          // {text: "hello", limit: 5}). We also accept an array of positional
-          // strings for CLI-emulating callers that haven't been rewritten yet.
-          // The dispatcher forwards `args` verbatim to the upstream client.
-          args: {
-            description:
-              "Arguments forwarded to the upstream MCP tool. Object of named params (typical MCP shape) or array of positional strings (CLI shape).",
-            oneOf: [
-              { type: "object", additionalProperties: true },
-              { type: "array", items: { type: "string" } },
-            ],
-          },
+          args: runArgsSchema,
           stdin: { type: "string", description: "Optional: piped into the tool's stdin." },
         },
         additionalProperties: false,
@@ -394,7 +396,7 @@ function syntheticHelpRunSpecs(serviceName) {
  */
 function applyToolModeToMcpCatalog(tools, svc, toolMode, serviceName) {
   if (toolMode === "normal") return tools;
-  return syntheticHelpRunSpecs(serviceName);
+  return syntheticHelpRunSpecs(serviceName, svc.adapter);
 }
 
 for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) {
@@ -569,25 +571,50 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
       // under dual / triple mode). In normal mode this is the same as the
       // active catalog. Callers use these names with `<svc>_run`.
       const upstream = perServiceUpstreamMcpTools[dispatch.serviceName] || [];
+      const selected = commandPath.length === 1
+        ? upstream.find(t => t.name === commandPath[0])
+        : null;
+      const toolLines = selected
+        ? [
+            `Tool: ${selected.name}`,
+            `Description: ${(selected.description || "").split(/\r?\n/)[0].slice(0, 160)}`,
+            "Input schema:",
+            "```json",
+            JSON.stringify(selected.inputSchema || {}, null, 2),
+            "```",
+          ]
+        : commandPath.length === 0
+          ? upstream.map(t => {
+              const schema = t.inputSchema || {};
+              const properties = Object.keys(schema.properties || {});
+              const required = Array.isArray(schema.required) ? schema.required : [];
+              const summary = [
+                properties.length > 0 ? `props: ${properties.join(", ")}` : null,
+                required.length > 0 ? `required: ${required.join(", ")}` : null,
+              ].filter(Boolean).join("; ");
+              return `  - ${t.name}: ${(t.description || "").split(/\r?\n/)[0].slice(0, 160)}${summary ? ` (${summary})` : ""}`;
+            })
+          : upstream.map(t =>
+              `  - ${t.name}: ${(t.description || "").split(/\r?\n/)[0].slice(0, 160)}`,
+            );
       const lines = [
         `Help for MCP service "${dispatch.serviceName}"${commandPathText}.`,
         `Adapter: ${svc.adapter}.`,
         `Tool mode: ${resolveToolMode(svc)}.`,
         "",
-        "Available upstream tools (use `<svc>_run` with commandPath=['<tool_name>']):",
-        ...upstream.map(t =>
-          `  - ${t.name}: ${(t.description || "").split(/\r?\n/)[0].slice(0, 160)}`,
-        ),
+        selected ? "Selected upstream tool:" : "Available upstream tools (use `<svc>_run` with commandPath=['<tool_name>']):",
+        ...toolLines,
       ];
       let text = lines.join("\n");
+      const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
+        ? "\n\n---\n\n" + workspaceHelpText()
+        : "";
+      text += workspaceSection;
       if (text.length > serviceMaxBytes) {
         text = text.slice(0, serviceMaxBytes) +
           `\n\n[TRUNCATED: help was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
       }
-      const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
-        ? "\n\n---\n\n" + workspaceHelpText()
-        : "";
-      return { content: [{ type: "text", text: text + workspaceSection }] };
+      return { content: [{ type: "text", text }] };
     }
     const argv = [...(svc.args || [])];
     if (commandPath.length > 0) argv.push(...commandPath);
@@ -633,10 +660,10 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
           content: [{ type: "text", text: `${dispatch.serviceName}_run requires commandPath=['<tool_name>'] for MCP adapters.` }],
         };
       }
-      // `args` may be either an object of named arguments (the typical MCP
-      // shape) or an array of positional strings (CLI-emulating callers).
-      // Schema below permits both.
       const args = callArgs.args;
+      if (Array.isArray(args)) {
+        throw new Error("Invalid args for MCP adapter: expected object, received array");
+      }
       const result = await caller.callTool(upstreamName, args);
       const blocks = result.content || [];
       const textBlocks = blocks.filter(c => c.type === "text");
