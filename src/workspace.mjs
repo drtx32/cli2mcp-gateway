@@ -129,6 +129,19 @@ export function resolveWorkspaceConfig(cfg, boxDir, opts = {}) {
   // Canonicalise after mkdir — the path could cross a symlink whose target
   // is more "real" than what we just created.
   const root = realpathSync(absPath);
+  let rootStat;
+  try {
+    rootStat = statSync(root);
+  } catch (err) {
+    throw new Error(
+      `workspace: failed to inspect configured path "${rawPath}" (resolved: ${root}): ${err.message}`,
+    );
+  }
+  if (!rootStat.isDirectory()) {
+    throw new Error(
+      `workspace: configured path "${rawPath}" (resolved: ${root}) is not a directory`,
+    );
+  }
 
   return buildRuntime(root, cfg, toolMode);
 }
@@ -413,9 +426,16 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
       if (runtime.cleanupPolicy === "largest_first") return b.size - a.size;
       return a.mtime - b.mtime; // oldest_first
     });
+    let remainingFiles = remaining.length;
     for (const f of sorted) {
-      if (remaining.length - deleted <= runtime.maxFiles && totalBytes <= runtime.maxTotalBytes) break;
-      try { await rm(f.abs, { force: true }); deleted++; bytesReclaimed += f.size; totalBytes -= f.size; } catch {}
+      if (remainingFiles <= runtime.maxFiles && totalBytes <= runtime.maxTotalBytes) break;
+      try {
+        await rm(f.abs, { force: true });
+        deleted++;
+        remainingFiles--;
+        bytesReclaimed += f.size;
+        totalBytes -= f.size;
+      } catch {}
     }
   }
   return { deleted, bytesReclaimed };

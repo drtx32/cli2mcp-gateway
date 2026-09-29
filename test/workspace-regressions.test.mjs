@@ -633,3 +633,46 @@ test("R4-1: enforceQuotas aggregate pass does not double-count evicted files", a
     assert.ok(out.deleted >= 2, `expected >= 2 deletions (per-file + aggregate), got ${out.deleted}`);
   } finally { cleanup(boxDir); }
 });
+
+test("quota pass counts files remaining after per-file eviction", async () => {
+  const boxDir = mkBoxDir();
+  try {
+    mkdirSync(resolve(boxDir, "w"), { recursive: true });
+    writeFileSync(resolve(boxDir, "w/oversized.bin"), "x".repeat(6));
+    writeFileSync(resolve(boxDir, "w/a.txt"), "a");
+    writeFileSync(resolve(boxDir, "w/b.txt"), "b");
+    const runtime = resolveWorkspaceConfig(
+      {
+        path: "./w",
+        max_file_bytes: 5,
+        max_files: 2,
+        max_total_bytes: 100,
+        cleanup_policy: "oldest_first",
+        ttl_seconds: 0,
+      },
+      boxDir,
+      { tool_mode: "normal" },
+    );
+    await enforceQuotas(runtime);
+    const remaining = ["a.txt", "b.txt"].filter(n =>
+      existsSync(resolve(boxDir, `w/${n}`)),
+    );
+    assert.equal(remaining.length, 2,
+      "max_files must be evaluated against files left after the oversized file is evicted");
+  } finally { cleanup(boxDir); }
+});
+
+test("resolveWorkspaceConfig rejects a configured file as the workspace root", () => {
+  const boxDir = mkBoxDir();
+  try {
+    writeFileSync(resolve(boxDir, "not-a-directory"), "x");
+    assert.throws(
+      () => resolveWorkspaceConfig(
+        { path: "./not-a-directory" },
+        boxDir,
+        { tool_mode: "normal" },
+      ),
+      /not a directory/,
+    );
+  } finally { cleanup(boxDir); }
+});
