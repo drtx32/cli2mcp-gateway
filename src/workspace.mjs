@@ -357,12 +357,16 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
   }
   let deleted = 0;
   let bytesReclaimed = 0;
+  // The post-eviction total is tracked so per-file eviction can deduct from
+  // the same running total the aggregate-bucket pass checks against.
+  let totalBytes = all.reduce((a, b) => a + b.size, 0);
+  const maxFileBytes = runtime.maxFileBytes;
   // 1) TTL pass — drop anything older than ttl_seconds, regardless of policy.
   if (runtime.ttlSeconds > 0) {
     const cutoff = now - runtime.ttlSeconds * 1000;
     for (const f of all) {
       if (f.mtime < cutoff) {
-        try { await rm(f.abs, { force: true }); deleted++; bytesReclaimed += f.size; } catch {}
+        try { await rm(f.abs, { force: true }); deleted++; bytesReclaimed += f.size; totalBytes -= f.size; } catch {}
       }
     }
     if (deleted > 0) {
@@ -373,9 +377,21 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
       }));
     }
   }
-  // 2) Quota pass — only when cleanup_policy != "none".
+  // 2) Per-file cap — drop any single file larger than maxFileBytes. A
+  //    downstream CLI can otherwise plant an arbitrarily large artifact that
+  //    passes the aggregate-bucket check (e.g. one 500 MiB file inside a 1 GiB
+  //    total budget) yet violates the documented per-file limit. Run this
+  //    before the aggregate-bucket pass so the post-eviction totals reflect
+  //    the per-file eviction.
+  if (Number.isFinite(maxFileBytes) && maxFileBytes > 0) {
+    for (const f of all) {
+      if (f.size > maxFileBytes) {
+        try { await rm(f.abs, { force: true }); deleted++; bytesReclaimed += f.size; totalBytes -= f.size; } catch {}
+      }
+    }
+  }
+  // 3) Quota pass — only when cleanup_policy != "none".
   if (CLEANUP_POLICIES.has(runtime.cleanupPolicy) && runtime.cleanupPolicy !== "none") {
-    let totalBytes = all.reduce((a, b) => a + b.size, 0);
     const sorted = [...all].sort((a, b) => {
       if (runtime.cleanupPolicy === "largest_first") return b.size - a.size;
       return a.mtime - b.mtime; // oldest_first
@@ -391,6 +407,14 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
 /**
  * Read quota metrics without running cleanup. Useful for `dir` so agents can
  * see how full the workspace is.
+ *
+ * Quota metrics count every file under the root (including hidden ones)
+ * because visibility policy and quota policy are different concerns:
+ *   - visibility (`allow_hidden_files`) gates list / read / stat
+ *   - quota limits the actual disk consumption the workspace is allowed
+ *     to take, regardless of whether the agent can see those entries.
+ * Skipping hidden files here would let `.cache/artifact` style writes
+ * silently inflate the workspace beyond the configured budget.
  */
 export async function quotaStats(runtime) {
   const result = { files: 0, totalBytes: 0, maxFiles: runtime.maxFiles, maxTotalBytes: runtime.maxTotalBytes, ttlSeconds: runtime.ttlSeconds, cleanupPolicy: runtime.cleanupPolicy };
@@ -401,7 +425,6 @@ export async function quotaStats(runtime) {
     let ents;
     try { ents = await readdir(abs, { withFileTypes: true }); } catch { continue; }
     for (const ent of ents) {
-      if (!runtime.allowHidden && ent.name.startsWith(".")) continue;
       const childAbs = `${abs}${sep}${ent.name}`;
       let st;
       try { st = lstatSync(childAbs); } catch { continue; }
@@ -426,8 +449,14 @@ export async function quotaStats(runtime) {
  * current quota metrics. The path is what agents should pass to downstream
  * CLI flags like `--output`, `-o`, `--save`, etc. Including the quota state
  * lets the agent see when cleanup will fire next.
+ *
+ * Runs `enforceQuotas` first so a normal `dir → downstream CLI` workflow
+ * actually triggers cleanup even when the caller never invokes `list` or
+ * `read`. The metrics reported afterward therefore reflect the post-eviction
+ * state, not the pre-call state.
  */
 export async function opDir(runtime) {
+  await enforceQuotas(runtime);
   const quotas = await quotaStats(runtime);
   return { root: runtime.root, quotas };
 }

@@ -491,3 +491,100 @@ test("R2-6: ttl_seconds=0 is preserved as disabled (no TTL eviction)", async () 
       "very_old.txt must remain when TTL is disabled");
   } finally { cleanup(boxDir); }
 });
+
+// =====================================================================
+// Round-3 Codex findings (PR #3 after R2) — three more findings surfaced
+// after the R2 push. Each test fails on the prior code and passes after
+// the corresponding fix.
+// =====================================================================
+
+// R3-1 (P1): enforceQuotas must evict files larger than max_file_bytes,
+// not just lower the read cap. Otherwise a downstream CLI can plant a
+// 500 MiB artifact inside a 1 GiB total budget and the per-file limit
+// becomes a no-op.
+
+test("R3-1: enforceQuotas evicts a single file larger than max_file_bytes", async () => {
+  const boxDir = mkBoxDir();
+  try {
+    mkdirSync(resolve(boxDir, "w"), { recursive: true });
+    writeFileSync(resolve(boxDir, "w/small.txt"), "x");
+    // 2 MiB file, configured limit is 1 MiB.
+    writeFileSync(resolve(boxDir, "w/huge.bin"), "x".repeat(2 * 1024 * 1024));
+    const runtime = resolveWorkspaceConfig(
+      {
+        path: "./w",
+        max_file_bytes: 1024 * 1024,
+        max_total_bytes: 100 * 1024 * 1024, // well above the file size
+        max_files: 1000,
+        cleanup_policy: "oldest_first",
+        ttl_seconds: 0,
+      },
+      boxDir,
+      { tool_mode: "normal" },
+    );
+    const out = await enforceQuotas(runtime);
+    assert.ok(out.deleted >= 1, `expected huge.bin eviction, deletions=${out.deleted}`);
+    assert.equal(existsSync(resolve(boxDir, "w/huge.bin")), false,
+      "files larger than max_file_bytes must be evicted even when aggregate budget allows them");
+    assert.equal(existsSync(resolve(boxDir, "w/small.txt")), true);
+  } finally { cleanup(boxDir); }
+});
+
+// R3-2 (P2): opDir must run enforceQuotas before reporting quota metrics.
+// Otherwise a workflow that only calls `dir` (then dispatches downstream
+// CLIs) lets TTL/quota violations linger indefinitely.
+
+test("R3-2: opDir invokes enforceQuotas so TTL-expired entries don't linger", async () => {
+  const boxDir = mkBoxDir();
+  try {
+    mkdirSync(resolve(boxDir, "w"), { recursive: true });
+    writeFileSync(resolve(boxDir, "w/stale.txt"), "stale");
+    // Backdate stale.txt past a 5-minute TTL.
+    const oldMtime = new Date(Date.now() - 10 * 60 * 1000);
+    utimesSync(resolve(boxDir, "w/stale.txt"), oldMtime, oldMtime);
+    writeFileSync(resolve(boxDir, "w/fresh.txt"), "fresh");
+    const runtime = resolveWorkspaceConfig(
+      { path: "./w", ttl_seconds: 300, cleanup_policy: "oldest_first" },
+      boxDir,
+      { tool_mode: "normal" },
+    );
+    // Import opDir for this test (named import; box-config.mjs / workspace.mjs
+    // re-export it). The previous code only called quotaStats here, so the
+    // stale file would survive — the fix routes the call through
+    // enforceQuotas first.
+    const { opDir, quotaStats } = await import("../src/workspace.mjs");
+    const before = await quotaStats(runtime);
+    assert.ok(before.files >= 2, `pre-call: expected >= 2 files, got ${before.files}`);
+    const out = await opDir(runtime);
+    assert.ok(out.quotas.files <= before.files - 1,
+      `post-dir: stale file must be evicted by opDir's enforceQuotas pass; before=${before.files}, after=${out.quotas.files}`);
+    assert.equal(existsSync(resolve(boxDir, "w/stale.txt")), false,
+      "stale file must be deleted by opDir's enforceQuotas");
+    assert.equal(existsSync(resolve(boxDir, "w/fresh.txt")), true);
+  } finally { cleanup(boxDir); }
+});
+
+// R3-3 (P2): quotaStats must include hidden files in its totals. Visibility
+// and quota policy are different concerns: skipping hidden files lets
+// `.cache/artifact` style writes inflate the workspace beyond budget
+// without the metrics reflecting it.
+
+test("R3-3: quotaStats counts hidden files when allow_hidden_files=false", async () => {
+  const boxDir = mkBoxDir();
+  try {
+    mkdirSync(resolve(boxDir, "w"), { recursive: true });
+    writeFileSync(resolve(boxDir, "w/visible.txt"), "x".repeat(500));
+    writeFileSync(resolve(boxDir, "w/.hidden.txt"), "x".repeat(1500));
+    const { quotaStats } = await import("../src/workspace.mjs");
+    const runtime = resolveWorkspaceConfig(
+      { path: "./w", allow_hidden_files: false },
+      boxDir,
+      { tool_mode: "normal" },
+    );
+    const stats = await quotaStats(runtime);
+    assert.equal(stats.files, 2,
+      `quotaStats must count hidden files; got files=${stats.files}`);
+    assert.equal(stats.totalBytes, 500 + 1500,
+      `quotaStats totalBytes must include hidden-file bytes; got ${stats.totalBytes}`);
+  } finally { cleanup(boxDir); }
+});
