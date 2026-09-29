@@ -361,12 +361,21 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
   // the same running total the aggregate-bucket pass checks against.
   let totalBytes = all.reduce((a, b) => a + b.size, 0);
   const maxFileBytes = runtime.maxFileBytes;
+  // Track which entries have already been evicted by earlier sub-iterations
+  // (TTL pass, per-file pass) so the aggregate-bucket pass doesn't double-
+  // count the same file as deleted (which would silently stop before the
+  // workspace is actually inside budget).
+  const evictedAbs = new Set();
   // 1) TTL pass — drop anything older than ttl_seconds, regardless of policy.
   if (runtime.ttlSeconds > 0) {
     const cutoff = now - runtime.ttlSeconds * 1000;
     for (const f of all) {
       if (f.mtime < cutoff) {
-        try { await rm(f.abs, { force: true }); deleted++; bytesReclaimed += f.size; totalBytes -= f.size; } catch {}
+        try {
+          await rm(f.abs, { force: true });
+          deleted++; bytesReclaimed += f.size; totalBytes -= f.size;
+          evictedAbs.add(f.abs);
+        } catch {}
       }
     }
     if (deleted > 0) {
@@ -386,18 +395,26 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
   if (Number.isFinite(maxFileBytes) && maxFileBytes > 0) {
     for (const f of all) {
       if (f.size > maxFileBytes) {
-        try { await rm(f.abs, { force: true }); deleted++; bytesReclaimed += f.size; totalBytes -= f.size; } catch {}
+        try {
+          await rm(f.abs, { force: true });
+          deleted++; bytesReclaimed += f.size; totalBytes -= f.size;
+          evictedAbs.add(f.abs);
+        } catch {}
       }
     }
   }
-  // 3) Quota pass — only when cleanup_policy != "none".
+  // 3) Quota pass — only when cleanup_policy != "none". Filter out entries
+  //    that the TTL or per-file passes already removed so we don't try to
+  //    rm a non-existent path AND double-count its bytes against the
+  //    running total.
   if (CLEANUP_POLICIES.has(runtime.cleanupPolicy) && runtime.cleanupPolicy !== "none") {
-    const sorted = [...all].sort((a, b) => {
+    const remaining = all.filter(f => !evictedAbs.has(f.abs));
+    const sorted = [...remaining].sort((a, b) => {
       if (runtime.cleanupPolicy === "largest_first") return b.size - a.size;
       return a.mtime - b.mtime; // oldest_first
     });
     for (const f of sorted) {
-      if (all.length - deleted <= runtime.maxFiles && totalBytes <= runtime.maxTotalBytes) break;
+      if (remaining.length - deleted <= runtime.maxFiles && totalBytes <= runtime.maxTotalBytes) break;
       try { await rm(f.abs, { force: true }); deleted++; bytesReclaimed += f.size; totalBytes -= f.size; } catch {}
     }
   }

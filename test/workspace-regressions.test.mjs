@@ -588,3 +588,48 @@ test("R3-3: quotaStats counts hidden files when allow_hidden_files=false", async
       `quotaStats totalBytes must include hidden-file bytes; got ${stats.totalBytes}`);
   } finally { cleanup(boxDir); }
 });
+
+// R4-1 (P1): enforceQuotas aggregate-bucket pass must skip entries already
+// evicted by the per-file / TTL passes. Without filtering, double-counting
+// of the same file's bytes against totalBytes stops the loop while the
+// workspace is still over budget. Concrete repro: max_file_bytes=5,
+// max_total_bytes=8, files of sizes 6, 5, 5 bytes — the per-file pass
+// removes the 6-byte file, but the aggregate pass sees it in `sorted` and
+// subtracts its bytes a second time, leaving both 5-byte files in place
+// (10 bytes > 8 budget).
+
+test("R4-1: enforceQuotas aggregate pass does not double-count evicted files", async () => {
+  const boxDir = mkBoxDir();
+  try {
+    mkdirSync(resolve(boxDir, "w"), { recursive: true });
+    writeFileSync(resolve(boxDir, "w/oversized.bin"), "x".repeat(6)); // > max_file_bytes=5
+    writeFileSync(resolve(boxDir, "w/a.txt"), "x".repeat(5));
+    writeFileSync(resolve(boxDir, "w/b.txt"), "x".repeat(5));
+    const runtime = resolveWorkspaceConfig(
+      {
+        path: "./w",
+        max_file_bytes: 5,
+        max_total_bytes: 8,
+        max_files: 1000,
+        cleanup_policy: "oldest_first",
+        ttl_seconds: 0,
+      },
+      boxDir,
+      { tool_mode: "normal" },
+    );
+    const out = await enforceQuotas(runtime);
+    // The oversized file must be evicted by the per-file pass.
+    assert.equal(existsSync(resolve(boxDir, "w/oversized.bin")), false,
+      "oversized file must be evicted by the per-file cap");
+    // The aggregate pass must keep going until totalBytes <= 8. With
+    // double-counting bug, totalBytes would shrink by 6 twice (becoming -4)
+    // and the loop would break early with both 5-byte files still on disk.
+    // After the fix, exactly one of the 5-byte files must be evicted.
+    const remaining = ["a.txt", "b.txt"].filter(n =>
+      existsSync(resolve(boxDir, `w/${n}`))
+    );
+    assert.equal(remaining.length, 1,
+      `aggregate pass must evict one of the 5-byte files to satisfy max_total_bytes=8; remaining=${remaining.join(",")}`);
+    assert.ok(out.deleted >= 2, `expected >= 2 deletions (per-file + aggregate), got ${out.deleted}`);
+  } finally { cleanup(boxDir); }
+});
