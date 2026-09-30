@@ -328,29 +328,27 @@ const CLEANUP_POLICIES = new Set(["oldest_first", "largest_first", "none"]);
  *
  * @returns {Promise<{deleted: number, bytesReclaimed: number}>}
  */
-export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
+export async function enforceQuotas(runtime, { now = Date.now(), readdirFn = readdir } = {}) {
   if (!runtime.root) return { deleted: 0, bytesReclaimed: 0, permissionErrors: [] };
   // Collect every file under the root. We use lstat so symlinks aren't
   // followed into the budget — a symlink to a 1GB file shouldn't push us
   // over quota, and we don't have a sane way to delete the target anyway.
   const all = [];
-  const permissionErrors = [];
   const stack = ["."];
   while (stack.length > 0) {
     const rel = stack.pop();
     const abs = rel === "." ? runtime.root : `${runtime.root}${sep}${rel}`;
     let ents;
     try {
-      ents = await readdir(abs, { withFileTypes: true });
+      ents = await readdirFn(abs, { withFileTypes: true });
     } catch (err) {
-      if (err?.code === "EACCES" || err?.code === "EPERM") {
-        permissionErrors.push({
-          rel: rel === "." ? "." : rel,
-          code: err.code,
-          message: err.message,
-        });
-      }
-      continue;
+      const code = err?.code || "UNKNOWN";
+      const detail = err?.message || String(err);
+      throw new Error(
+        "workspace: quota traversal failed at \"" + (rel === "." ? "." : rel) +
+        "\" (" + code + "): " + detail +
+        ". Quota enforcement requires a complete inventory and fails closed on unreadable paths.",
+      );
     }
     for (const ent of ents) {
       // Visibility policy (allow_hidden_files) only affects what the agent
@@ -360,7 +358,16 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
       const childRel = rel === "." ? ent.name : `${rel}${sep}${ent.name}`;
       const childAbs = `${abs}${sep}${ent.name}`;
       let st;
-      try { st = lstatSync(childAbs); } catch { continue; }
+      try {
+        st = lstatSync(childAbs);
+      } catch (err) {
+        const code = err?.code || "UNKNOWN";
+        throw new Error(
+          "workspace: quota traversal failed at \"" + childRel + "\" (" + code + "): " +
+          (err?.message || String(err)) +
+          ". Quota enforcement requires a complete inventory and fails closed on unreadable paths.",
+        );
+      }
       if (st.isSymbolicLink()) {
         // Treat symlinks as zero-cost metadata; we never delete them via
         // quota logic (the operator opted into them, if at all).
@@ -405,10 +412,10 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
     }
     if (deleted > 0) {
       // Rebuild after TTL deletion so the eviction pass below sees fresh state.
-      return enforceQuotas(runtime, { now }).then(r => ({
+      return enforceQuotas(runtime, { now, readdirFn }).then(r => ({
         deleted: r.deleted + deleted,
         bytesReclaimed: r.bytesReclaimed + bytesReclaimed,
-        permissionErrors: [...permissionErrors, ...r.permissionErrors],
+        permissionErrors: [],
       }));
     }
   }
@@ -451,7 +458,7 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
       } catch {}
     }
   }
-  return { deleted, bytesReclaimed, permissionErrors };
+  return { deleted, bytesReclaimed, permissionErrors: [] };
 }
 
 /**
@@ -466,7 +473,7 @@ export async function enforceQuotas(runtime, { now = Date.now() } = {}) {
  * Skipping hidden files here would let `.cache/artifact` style writes
  * silently inflate the workspace beyond the configured budget.
  */
-export async function quotaStats(runtime) {
+export async function quotaStats(runtime, { readdirFn = readdir } = {}) {
   const result = { files: 0, totalBytes: 0, maxFiles: runtime.maxFiles, maxTotalBytes: runtime.maxTotalBytes, ttlSeconds: runtime.ttlSeconds, cleanupPolicy: runtime.cleanupPolicy, permissionErrors: [] };
   if (!runtime.root) return result;
   const stack = [runtime.root];
@@ -474,21 +481,30 @@ export async function quotaStats(runtime) {
     const abs = stack.pop();
     let ents;
     try {
-      ents = await readdir(abs, { withFileTypes: true });
+      ents = await readdirFn(abs, { withFileTypes: true });
     } catch (err) {
-      if (err?.code === "EACCES" || err?.code === "EPERM") {
-        result.permissionErrors.push({
-          rel: relative(runtime.root, abs) || ".",
-          code: err.code,
-          message: err.message,
-        });
-      }
-      continue;
+      const relPath = relative(runtime.root, abs) || ".";
+      const code = err?.code || "UNKNOWN";
+      throw new Error(
+        "workspace: quota traversal failed at \"" + relPath + "\" (" + code + "): " +
+        (err?.message || String(err)) +
+        ". Quota stats require a complete inventory and fail closed on unreadable paths.",
+      );
     }
     for (const ent of ents) {
       const childAbs = `${abs}${sep}${ent.name}`;
       let st;
-      try { st = lstatSync(childAbs); } catch { continue; }
+      try {
+        st = lstatSync(childAbs);
+      } catch (err) {
+        const relPath = relative(runtime.root, childAbs) || ".";
+        const code = err?.code || "UNKNOWN";
+        throw new Error(
+          "workspace: quota traversal failed at \"" + relPath + "\" (" + code + "): " +
+          (err?.message || String(err)) +
+          ". Quota stats require a complete inventory and fail closed on unreadable paths.",
+        );
+      }
       if (st.isSymbolicLink()) continue;
       if (st.isDirectory()) {
         stack.push(childAbs);
@@ -516,13 +532,9 @@ export async function quotaStats(runtime) {
  * `read`. The metrics reported afterward therefore reflect the post-eviction
  * state, not the pre-call state.
  */
-export async function opDir(runtime) {
-  const enforcement = await enforceQuotas(runtime);
-  const quotas = await quotaStats(runtime);
-  quotas.permissionErrors = [
-    ...enforcement.permissionErrors,
-    ...quotas.permissionErrors,
-  ];
+export async function opDir(runtime, { readdirFn = readdir } = {}) {
+  await enforceQuotas(runtime, { readdirFn });
+  const quotas = await quotaStats(runtime, { readdirFn });
   return { root: runtime.root, quotas };
 }
 
@@ -537,12 +549,12 @@ export async function opDir(runtime) {
  * are NEVER recursed into when follow_symlinks is false; when true, the
  * resolved target must remain inside the workspace.
  */
-export async function opList(runtime, args) {
+export async function opList(runtime, args, { readdirFn = readdir } = {}) {
   const target = typeof args?.path === "string" && args.path.length > 0 ? args.path : ".";
   const canonical = canonicaliseInsideRoot(target, runtime);
   const recursive = args?.recursive === true;
   // Cleanup before listing so the entry set reflects the post-quota state.
-  await enforceQuotas(runtime);
+  await enforceQuotas(runtime, { readdirFn });
   const s = await fsStat(canonical);
   if (!s.isDirectory()) {
     throw new Error(`workspace: list target "${args?.path ?? "."}" is not a directory`);
@@ -615,12 +627,13 @@ function walk(absDir, relPrefix, out, limit, recursive, runtime) {
 /**
  * `workspace.stat` — metadata for a single path.
  */
-export async function opStat(runtime, args) {
+export async function opStat(runtime, args, { readdirFn = readdir } = {}) {
   const target = args?.path;
   if (typeof target !== "string" || target.length === 0) {
     throw new Error("workspace: stat requires a path argument");
   }
   const canonical = canonicaliseInsideRoot(target, runtime);
+  await enforceQuotas(runtime, { readdirFn });
   const s = await fsStat(canonical);
   return {
     path: relative(runtime.root, canonical) || ".",
@@ -656,7 +669,7 @@ async function fsStat(p) {
  *   - Unknown / binary / oversized-for-image formats return an error
  *     explaining the constraint, never arbitrary bytes.
  */
-export async function opRead(runtime, args) {
+export async function opRead(runtime, args, { readdirFn = readdir } = {}) {
   const target = args?.path;
   if (typeof target !== "string" || target.length === 0) {
     throw new Error("workspace: read requires a path argument");
@@ -681,7 +694,7 @@ export async function opRead(runtime, args) {
   // Opportunistic cleanup before reading — if the workspace is over quota
   // we drop oldest / largest entries so the read sees a coherent view. This
   // keeps a long-running session within budget without a background timer.
-  await enforceQuotas(runtime);
+  await enforceQuotas(runtime, { readdirFn });
   // Read raw bytes once, then decide content type by extension.
   const bytes = readFileSync(canonical);
   const ext = extOf(canonical);
@@ -795,16 +808,16 @@ export function workspaceToolSpec() {
  * @param {object} runtime    from resolveWorkspaceConfig
  * @param {object} args       tool call arguments
  */
-export async function callWorkspace(runtime, args) {
+export async function callWorkspace(runtime, args, deps = {}) {
   const sub = args?.subcommand;
   if (typeof sub !== "string" || sub.length === 0) {
     throw new Error("workspace: subcommand is required (dir | list | stat | read)");
   }
   switch (sub) {
-    case "dir":   return await opDir(runtime, args);
-    case "list":  return await opList(runtime, args);
-    case "stat":  return await opStat(runtime, args);
-    case "read":  return await opRead(runtime, args);
+    case "dir":   return await opDir(runtime, deps);
+    case "list":  return await opList(runtime, args, deps);
+    case "stat":  return await opStat(runtime, args, deps);
+    case "read":  return await opRead(runtime, args, deps);
     default: throw new Error(`workspace: unknown subcommand "${sub}"`);
   }
 }

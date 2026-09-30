@@ -32,6 +32,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { readdir as promiseReaddir } from "node:fs/promises";
 
 import { loadBoxConfig } from "../src/box-config.mjs";
 import {
@@ -684,15 +685,77 @@ test("R5-1b: root synthetic MCP help includes props and required labels", () => 
   assert.match(source, /`required: \$\{required\.join\(\", \"\)\}`/);
 });
 
-// R5-2: permission failures during quota walks must be observable rather
-// than treated as an empty subtree. This source-level regression complements
-// the filesystem test used by the supervisor on a non-root runner (root can
-// read mode-000 directories, so chmod-based EACCES is not reproducible here).
-test("R5-2: quota walks surface permissionErrors for unreadable subtrees", () => {
-  const source = readFileSync(resolve(import.meta.dirname, "../src/workspace.mjs"), "utf8");
-  assert.match(source, /permissionErrors\.push\(\{/);
-  assert.match(source, /err\?\.code === "EACCES" \|\| err\?\.code === "EPERM"/);
-  assert.match(source, /quotas\.permissionErrors = \[/);
+// R5-2 / final P1: quota traversal must fail closed when any subtree cannot
+// be inventoried. Use an injected readdir wrapper so the regression is
+// portable even when tests run as root (chmod 000 does not reliably produce
+// EACCES there). No workspace operation may continue on a partial inventory.
+test("R5-2: quota traversal EACCES/EPERM aborts enforcement, stats, and workspace ops", async () => {
+  const boxDir = mkBoxDir();
+  try {
+    mkdirSync(resolve(boxDir, "w/blocked"), { recursive: true });
+    writeFileSync(resolve(boxDir, "w/visible.txt"), "visible");
+    writeFileSync(resolve(boxDir, "w/blocked/hidden.txt"), "hidden");
+
+    const runtime = resolveWorkspaceConfig(
+      {
+        path: "./w",
+        max_files: 1,
+        cleanup_policy: "oldest_first",
+        ttl_seconds: 0,
+      },
+      boxDir,
+      { tool_mode: "normal" },
+    );
+    const denied = resolve(boxDir, "w/blocked");
+    const { quotaStats } = await import("../src/workspace.mjs");
+
+    for (const code of ["EACCES", "EPERM"]) {
+      const readdirFn = async (path, options) => {
+        if (resolve(path) === denied) {
+          const err = new Error("synthetic unreadable subtree");
+          err.code = code;
+          throw err;
+        }
+        return promiseReaddir(path, options);
+      };
+      const expected = new RegExp(
+        "quota traversal failed.*blocked.*" + code,
+      );
+
+      await assert.rejects(
+        () => enforceQuotas(runtime, { readdirFn }),
+        expected,
+        "enforceQuotas must abort rather than enforce against partial inventory",
+      );
+      await assert.rejects(
+        () => quotaStats(runtime, { readdirFn }),
+        expected,
+        "quotaStats must refuse partial totals",
+      );
+
+      const calls = [
+        { subcommand: "dir" },
+        { subcommand: "list", path: "." },
+        { subcommand: "stat", path: "visible.txt" },
+        { subcommand: "read", path: "visible.txt" },
+      ];
+      for (const args of calls) {
+        await assert.rejects(
+          () => callWorkspace(runtime, args, { readdirFn }),
+          expected,
+          "workspace." + args.subcommand + " must propagate quota traversal failure",
+        );
+      }
+
+      // A failed inventory must not trigger eviction based on the visible
+      // subset. The visible file remains even though max_files=1.
+      assert.equal(
+        existsSync(resolve(boxDir, "w/visible.txt")),
+        true,
+        "fail-closed traversal must not mutate the workspace from partial inventory",
+      );
+    }
+  } finally { cleanup(boxDir); }
 });
 
 test("R5-3: MCP _run rejects array args instead of forwarding them", () => {
