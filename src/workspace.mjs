@@ -328,7 +328,7 @@ const CLEANUP_POLICIES = new Set(["oldest_first", "largest_first", "none"]);
  *
  * @returns {Promise<{deleted: number, bytesReclaimed: number}>}
  */
-export async function enforceQuotas(runtime, { now = Date.now(), readdirFn = readdir } = {}) {
+export async function enforceQuotas(runtime, { now = Date.now(), readdirFn = readdir, lstatFn = lstatSync } = {}) {
   if (!runtime.root) return { deleted: 0, bytesReclaimed: 0, permissionErrors: [] };
   // Collect every file under the root. We use lstat so symlinks aren't
   // followed into the budget — a symlink to a 1GB file shouldn't push us
@@ -355,12 +355,18 @@ export async function enforceQuotas(runtime, { now = Date.now(), readdirFn = rea
       // sees via list/read/stat — NOT what counts against disk quota. A
       // downstream CLI filling the disk through `.cache/artifact` would
       // otherwise be invisible to enforceQuotas. We walk every entry here.
+      // lstat may fail because the entry vanished between readdir and lstat
+      // (a downstream CLI producing/rotating output while we walk the tree).
+      // A vanished entry cannot consume quota, so we skip ENOENT and continue
+      // to fail closed on every other error — refusing to act on a partial
+      // inventory.
       const childRel = rel === "." ? ent.name : `${rel}${sep}${ent.name}`;
       const childAbs = `${abs}${sep}${ent.name}`;
       let st;
       try {
-        st = lstatSync(childAbs);
+        st = lstatFn(childAbs);
       } catch (err) {
+        if (err?.code === "ENOENT") continue;
         const code = err?.code || "UNKNOWN";
         throw new Error(
           "workspace: quota traversal failed at \"" + childRel + "\" (" + code + "): " +
@@ -412,7 +418,7 @@ export async function enforceQuotas(runtime, { now = Date.now(), readdirFn = rea
     }
     if (deleted > 0) {
       // Rebuild after TTL deletion so the eviction pass below sees fresh state.
-      return enforceQuotas(runtime, { now, readdirFn }).then(r => ({
+      return enforceQuotas(runtime, { now, readdirFn, lstatFn }).then(r => ({
         deleted: r.deleted + deleted,
         bytesReclaimed: r.bytesReclaimed + bytesReclaimed,
         permissionErrors: [],
@@ -473,7 +479,7 @@ export async function enforceQuotas(runtime, { now = Date.now(), readdirFn = rea
  * Skipping hidden files here would let `.cache/artifact` style writes
  * silently inflate the workspace beyond the configured budget.
  */
-export async function quotaStats(runtime, { readdirFn = readdir } = {}) {
+export async function quotaStats(runtime, { readdirFn = readdir, lstatFn = lstatSync } = {}) {
   const result = { files: 0, totalBytes: 0, maxFiles: runtime.maxFiles, maxTotalBytes: runtime.maxTotalBytes, ttlSeconds: runtime.ttlSeconds, cleanupPolicy: runtime.cleanupPolicy, permissionErrors: [] };
   if (!runtime.root) return result;
   const stack = [runtime.root];
@@ -493,10 +499,15 @@ export async function quotaStats(runtime, { readdirFn = readdir } = {}) {
     }
     for (const ent of ents) {
       const childAbs = `${abs}${sep}${ent.name}`;
+      // A vanished entry between readdir and lstat cannot consume quota
+      // (the downstream CLI produced/rotated output mid-walk), so we skip
+      // ENOENT and keep failing closed on every other error to avoid
+      // acting on a partial inventory.
       let st;
       try {
-        st = lstatSync(childAbs);
+        st = lstatFn(childAbs);
       } catch (err) {
+        if (err?.code === "ENOENT") continue;
         const relPath = relative(runtime.root, childAbs) || ".";
         const code = err?.code || "UNKNOWN";
         throw new Error(

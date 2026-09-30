@@ -29,6 +29,8 @@ import {
   utimesSync,
   symlinkSync,
   readFileSync,
+  lstatSync,
+  unlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -762,4 +764,84 @@ test("R5-3: MCP _run rejects array args instead of forwarding them", () => {
   const source = readFileSync(resolve(import.meta.dirname, "../src/server.mjs"), "utf8");
   assert.match(source, /adapter === "mcp-stdio" \|\| adapter === "mcp-http"/);
   assert.match(source, /Invalid args for MCP adapter: expected object, received array/);
+});
+
+// R5-4: lstat ENOENT during quota traversal must be skipped (the entry
+// vanished between readdir and lstat — a downstream CLI concurrently
+// rotating output). A vanished entry cannot consume quota, so traversal
+// continues on the visible inventory. Genuine permission / I/O errors
+// continue to fail closed.
+test("R5-4: lstat ENOENT during quota traversal is skipped, not failed", async () => {
+  const boxDir = mkBoxDir();
+  try {
+    mkdirSync(resolve(boxDir, "w"), { recursive: true });
+    writeFileSync(resolve(boxDir, "w/keep.txt"), "kept");
+    writeFileSync(resolve(boxDir, "w/vanish.txt"), "will-vanish");
+    const runtime = resolveWorkspaceConfig(
+      {
+        path: "./w",
+        max_files: 5,
+        max_total_bytes: 1024,
+        cleanup_policy: "oldest_first",
+        ttl_seconds: 0,
+      },
+      boxDir,
+      { tool_mode: "normal" },
+    );
+    const vanishAbs = resolve(boxDir, "w/vanish.txt");
+    // Simulate vanish.txt being deleted between readdir and lstat by
+    // removing it the moment readdir is called on the workspace root.
+    // The dirent is therefore already gone, but we re-introduce a stale
+    // dirent via the returned array so the production lstat call is
+    // actually reached and the new ENOENT branch is exercised end-to-end.
+    const readdirFn = async (path, options) => {
+      const ents = await promiseReaddir(path, options);
+      if (resolve(path) === resolve(boxDir, "w")) {
+        try { unlinkSync(vanishAbs); } catch {}
+        return [
+          ...ents.filter(e => e.name !== "vanish.txt"),
+          { name: "vanish.txt", isDirectory: () => false, isFile: () => true, isSymbolicLink: () => false },
+        ];
+      }
+      return ents;
+    };
+    const lstatFn = (path) => lstatSync(path);
+    const { quotaStats } = await import("../src/workspace.mjs");
+    const stats = await quotaStats(runtime, { readdirFn, lstatFn });
+    assert.equal(stats.files, 1, "vanished entry must not be counted in quotaStats");
+    assert.equal(stats.totalBytes, 4, "vanished entry size must not count toward totalBytes");
+    const enforced = await enforceQuotas(runtime, { readdirFn, lstatFn });
+    assert.equal(enforced.deleted, 0, "vanished entry must not be reported as deleted");
+    assert.equal(existsSync(resolve(boxDir, "w/keep.txt")), true,
+      "non-vanished entry must be untouched");
+  } finally { cleanup(boxDir); }
+});
+
+test("R5-4b: non-ENOENT lstat errors during quota traversal still fail closed", async () => {
+  const boxDir = mkBoxDir();
+  try {
+    mkdirSync(resolve(boxDir, "w"), { recursive: true });
+    writeFileSync(resolve(boxDir, "w/visible.txt"), "visible");
+    const runtime = resolveWorkspaceConfig(
+      { path: "./w", tool_mode: "normal" },
+      boxDir,
+      { tool_mode: "normal" },
+    );
+    const lstatFn = (path) => {
+      const err = new Error("synthetic unreadable");
+      err.code = "EACCES";
+      throw err;
+    };
+    const { quotaStats } = await import("../src/workspace.mjs");
+    await assert.rejects(
+      () => quotaStats(runtime, { lstatFn }),
+      /quota traversal failed.*EACCES/,
+      "quotaStats must still fail closed on EACCES from lstat",
+    );
+    await assert.rejects(
+      () => enforceQuotas(runtime, { lstatFn }),
+      /quota traversal failed.*EACCES/,
+      "enforceQuotas must still fail closed on EACCES from lstat",
+    );
+  } finally { cleanup(boxDir); }
 });
