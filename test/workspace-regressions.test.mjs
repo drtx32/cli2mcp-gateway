@@ -30,6 +30,7 @@ import {
   symlinkSync,
   readFileSync,
   lstatSync,
+  unlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -788,22 +789,23 @@ test("R5-4: lstat ENOENT during quota traversal is skipped, not failed", async (
       { tool_mode: "normal" },
     );
     const vanishAbs = resolve(boxDir, "w/vanish.txt");
+    // Simulate vanish.txt being deleted between readdir and lstat by
+    // removing it the moment readdir is called on the workspace root.
+    // The dirent is therefore already gone, but we re-introduce a stale
+    // dirent via the returned array so the production lstat call is
+    // actually reached and the new ENOENT branch is exercised end-to-end.
     const readdirFn = async (path, options) => {
       const ents = await promiseReaddir(path, options);
-      // Simulate vanish.txt being deleted between readdir and lstat.
       if (resolve(path) === resolve(boxDir, "w")) {
-        return ents.filter(e => e.name !== "vanish.txt");
+        try { unlinkSync(vanishAbs); } catch {}
+        return [
+          ...ents.filter(e => e.name !== "vanish.txt"),
+          { name: "vanish.txt", isDirectory: () => false, isFile: () => true, isSymbolicLink: () => false },
+        ];
       }
       return ents;
     };
-    const lstatFn = (path) => {
-      if (resolve(path) === vanishAbs) {
-        const err = new Error("synthetic vanish");
-        err.code = "ENOENT";
-        throw err;
-      }
-      return lstatSync(path);
-    };
+    const lstatFn = (path) => lstatSync(path);
     const { quotaStats } = await import("../src/workspace.mjs");
     const stats = await quotaStats(runtime, { readdirFn, lstatFn });
     assert.equal(stats.files, 1, "vanished entry must not be counted in quotaStats");
