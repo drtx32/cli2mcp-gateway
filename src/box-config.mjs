@@ -125,13 +125,13 @@ const ServiceBase = z.object({
   //   dual   — only `<cli>_help` and `<cli>_run` are exposed. Workspace is
   //            ignored even if configured (preserves legacy dual_tool_mode
   //            backwards compatibility).
-  //   triple — exactly `<cli>_help`, `<cli>_run`, and `workspace` are exposed.
+  //   triple — exactly `<cli>_help`, `<cli>_run`, and `<cli>_workspace` are exposed.
   //            workspace.path is REQUIRED.
   // Explicit tool_mode wins over the legacy `dual_tool_mode` flag when both
   // are set on the same service.
   tool_mode: z.enum(["normal", "dual", "triple"]).optional(),
   // Single-root read-only managed workspace. When `path` is set, the gateway
-  // exposes a synthetic `workspace` tool with subcommands dir / list / stat /
+  // exposes a synthetic `<cli>_workspace` tool with subcommands dir / list / stat /
   // read. The agent uses this to discover the canonical absolute workspace
   // path so downstream CLIs can be told where to save files — without those
   // CLIs needing to know about any CLI2MCP_* env var.

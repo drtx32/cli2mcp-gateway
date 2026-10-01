@@ -158,9 +158,9 @@ test("Finding 2: workspace dispatch.kind intercepts before mcp upstream forwardi
   // tool named `workspace` would receive the call and bypass the gateway's
   // read-only runtime. This test asserts the dispatch metadata exists on
   // the synthetic spec so the server-side check has something to match on.
-  const spec = workspaceToolSpec();
+  const spec = workspaceToolSpec("svc_workspace");
   assert.equal(spec.dispatch.kind, "workspace");
-  assert.equal(spec.name, "workspace");
+  assert.equal(spec.name, "svc_workspace");
 });
 
 // =====================================================================
@@ -298,9 +298,9 @@ test("Finding 5: tool_mode=triple catalog for an mcp-stdio service is _help+_run
     { name: "svc_help", description: "", inputSchema: {}, dispatch: { kind: "help" } },
     { name: "svc_run", description: "", inputSchema: {}, dispatch: { kind: "run" } },
   ];
-  const withWorkspace = [...replaced, workspaceToolSpec()];
+  const withWorkspace = [...replaced, workspaceToolSpec("svc_workspace")];
   const names = withWorkspace.map(t => t.name).sort();
-  assert.deepEqual(names, ["svc_help", "svc_run", "workspace"]);
+  assert.deepEqual(names, ["svc_help", "svc_run", "svc_workspace"]);
   // Original upstream tool names are NOT in the catalog.
   for (const t of tools) {
     assert.equal(names.includes(t.name), false);

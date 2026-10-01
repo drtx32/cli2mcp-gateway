@@ -212,27 +212,31 @@ gateway exposes it. Pick one:
 
 | `tool_mode`  | Tools exposed                                                                                  | `workspace.path` |
 |--------------|----------------------------------------------------------------------------------------------|------------------|
-| `normal`     | All recursively-discovered leaf tools + synthetic `help`. Optionally adds `workspace` if `workspace.path` is set. | optional        |
+| `normal`     | All recursively-discovered leaf tools + synthetic `help`. Optionally adds `<cli>_workspace` if `workspace.path` is set. | optional        |
 | `dual`       | Only `<cli>_help` and `<cli>_run`. `workspace.path` is **ignored** even if configured.       | ignored          |
-| `triple`     | Exactly `<cli>_help`, `<cli>_run`, and `workspace`. `workspace.path` is **required** — boot fails with a clear error otherwise. | required        |
+| `triple`     | Exactly `<cli>_help`, `<cli>_run`, and `<cli>_workspace`. `workspace.path` is **required** — boot fails with a clear error otherwise. | required        |
 
 Legacy `dual_tool_mode: true` still works and is equivalent to
 `tool_mode: dual`. When both flags are present, the explicit `tool_mode`
 wins.
 
+The names in the table are per-service tool names. With the default multi-service
+aggregation, the public name also includes the service name and `__` separator;
+the example below shows the resulting names.
+
 ### Managed workspace
 
 When `workspace.path` is configured and `tool_mode` is not `dual`, the
-gateway exposes a synthetic `workspace` tool that gives the agent
+gateway exposes a synthetic `<cli>_workspace` tool that gives the agent
 read-only access to a single canonical absolute directory. Subcommands:
 
-- `workspace(subcommand="dir")` — returns the canonical absolute path so
+- `<cli>_workspace(subcommand="dir")` — returns the canonical absolute path so
   the agent can pass it directly to downstream CLI flags like
   `--output`, `-o`, `--save`.
-- `workspace(subcommand="list", path?, recursive?)` — bounded recursive
+- `<cli>_workspace(subcommand="list", path?, recursive?)` — bounded recursive
   listing. `max_list_entries` caps the result.
-- `workspace(subcommand="stat", path)` — metadata for one entry.
-- `workspace(subcommand="read", path)` — returns the file as a typed MCP
+- `<cli>_workspace(subcommand="stat", path)` — metadata for one entry.
+- `<cli>_workspace(subcommand="read", path)` — returns the file as a typed MCP
   content block: image content for PNG / JPEG / GIF / WebP, text content
   for UTF-8 / JSON / markdown / etc., and a structured error for anything
   binary or oversized.
@@ -281,8 +285,11 @@ transport:
   port: 3100
 ```
 
-In `triple` mode the agent sees three tools: `local_cli_help`, `local_cli_run`,
-and `workspace`. The agent is expected to call `workspace(subcommand="dir")`
+In `triple` mode the agent sees three tools: `local_cli__my-cli_help`,
+`local_cli__my-cli_run`, and `local_cli__my-cli_workspace` with the example
+above and default naming.
+The agent is expected to call
+`local_cli__my-cli_workspace(subcommand="dir")`
 to discover the canonical absolute workspace root, and then pass it to the
 downstream CLI's output / save flags. The downstream CLI does not need to
 read any `CLI2MCP_*` environment variable.

@@ -38,6 +38,7 @@ import {
   resolveWorkspaceConfig,
   resolveToolMode,
   workspaceToolSpec,
+  appendWorkspaceTool,
   callWorkspace,
   workspaceHelpText,
 } from "./workspace.mjs";
@@ -313,6 +314,7 @@ const perServiceTools = {};
 const perServiceCallers = {};
 /** @type {Record<string, ReturnType<typeof resolveWorkspaceConfig>>} workspace runtime per service, or null if not active */
 const perServiceWorkspace = {};
+const perServiceWorkspaceToolName = {};
 const perServiceUpstreamMcpTools = {};
 
 const boxConfigDir = box.path ? dirname(resolve(box.path)) : process.cwd();
@@ -344,7 +346,7 @@ function syntheticHelpRunSpecs(serviceName, adapter = "cli") {
       name: `${serviceName}_help`,
       description:
         `Gateway meta-tool: inspect the wrapped MCP service "${serviceName}". ` +
-        `Call with commandPath=["workspace"] to see gateway-managed workspace help, ` +
+        `Call with commandPath=["${serviceName}_workspace"] to see gateway-managed workspace help, ` +
         `or pass any sub-path to forward a help-style probe to the underlying service.`,
       inputSchema: {
         type: "object",
@@ -509,7 +511,21 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
     process.exit(1);
   }
   if (workspaceRuntime) {
-    perServiceTools[serviceName].push(workspaceToolSpec());
+    const cliNamespace = svc.adapter === "cli"
+      ? svc.command.replace(/^.*\//, "").replace(/[^A-Za-z0-9_-]/g, "_")
+      : serviceName;
+    const workspaceToolName = `${cliNamespace}_workspace`;
+    const workspaceTool = workspaceToolSpec(workspaceToolName);
+    try {
+      appendWorkspaceTool(perServiceTools[serviceName], workspaceTool, {
+        toolMode: workspaceRuntime.toolMode,
+        adapter: svc.adapter,
+      });
+    } catch (err) {
+      console.error(`[boot] ${serviceName}: ${err.message}`);
+      process.exit(1);
+    }
+    perServiceWorkspaceToolName[serviceName] = workspaceToolName;
     console.error(`[boot] ${serviceName}: workspace active at ${workspaceRuntime.root}` +
       ` (tool_mode=${workspaceRuntime.toolMode})`);
   }
@@ -557,12 +573,11 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
     const commandPath = Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0
       ? callArgs.commandPath
       : (typeof callArgs.sub === "string" && callArgs.sub ? [callArgs.sub] : []);
-    // Synthetic gateway-managed workspace help: when the agent asks for
-    // ["workspace"], return our text instead of forwarding to `<cli>
-    // workspace --help`. Workspace is read-only and lives entirely inside
-    // the gateway — there's no underlying CLI command to run.
-    if (commandPath.length === 1 && commandPath[0] === "workspace" && perServiceWorkspace[dispatch.serviceName]) {
-      return { content: [{ type: "text", text: workspaceHelpText() }] };
+    // Synthetic gateway-managed workspace help: when the agent asks for the
+    // namespaced workspace tool, return our text instead of forwarding to an
+    // underlying CLI command. Workspace is read-only and lives in the gateway.
+    if (commandPath.length === 1 && commandPath[0] === perServiceWorkspaceToolName[dispatch.serviceName] && perServiceWorkspace[dispatch.serviceName]) {
+      return { content: [{ type: "text", text: workspaceHelpText(perServiceWorkspaceToolName[dispatch.serviceName]) }] };
     }
     if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
       const commandPathText = commandPath.length > 0 ? ` ${commandPath.join(" ")}` : "";
@@ -607,7 +622,7 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
       ];
       let text = lines.join("\n");
       const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
-        ? "\n\n---\n\n" + workspaceHelpText()
+        ? "\n\n---\n\n" + workspaceHelpText(perServiceWorkspaceToolName[dispatch.serviceName])
         : "";
       text += workspaceSection;
       if (text.length > serviceMaxBytes) {
@@ -641,7 +656,7 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
       `Raw output from ${target}:`,
     ].join("\n");
     const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
-      ? "\n\n---\n\n" + workspaceHelpText()
+      ? "\n\n---\n\n" + workspaceHelpText(perServiceWorkspaceToolName[dispatch.serviceName])
       : "";
     return { content: [{ type: "text", text: `${header}\n\n${text}${workspaceSection}` }] };
   }

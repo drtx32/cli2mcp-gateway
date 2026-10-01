@@ -421,6 +421,7 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
     description:
       "Gateway meta-tool: run the wrapped CLI's --help and return its full text, prefixed with a short usage note. " +
       "Call this first when you need to discover what the CLI offers or what arguments a particular subcommand takes. " +
+      "When managed workspace access is enabled, use the synthetic `<cli>_workspace` tool for workspace operations. " +
       "Pass `sub` and `args` to drill down into a subcommand help page instead of calling high-level subcommands blindly.",
     inputSchema: {
       type: "object",
