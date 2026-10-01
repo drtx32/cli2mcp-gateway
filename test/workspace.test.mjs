@@ -430,19 +430,21 @@ test("read: binary content (not safely UTF-8) is rejected, not dumped", async ()
 // ---------- synthetic tool spec ----------
 
 test("workspaceToolSpec: declares all four subcommands in the schema", () => {
-  const spec = workspaceToolSpec();
-  assert.equal(spec.name, "workspace");
+  const spec = workspaceToolSpec("ashare_workspace");
+  assert.equal(spec.name, "ashare_workspace");
   assert.equal(spec.dispatch.kind, "workspace");
+  assert.equal(spec.dispatch.toolName, "ashare_workspace");
+  assert.match(spec.description, /ashare_workspace\(subcommand="dir"/);
   assert.deepEqual(spec.inputSchema.properties.subcommand.enum, ["dir", "list", "stat", "read"]);
   assert.ok(spec.inputSchema.required.includes("subcommand"));
 });
 
 test("workspaceHelpText: documents dir / list / stat / read subcommands", () => {
   const text = workspaceHelpText();
-  assert.match(text, /workspace\(subcommand="dir"/);
-  assert.match(text, /workspace\(subcommand="list"/);
-  assert.match(text, /workspace\(subcommand="stat"/);
-  assert.match(text, /workspace\(subcommand="read"/);
+  assert.match(text, /<cli>_workspace\(subcommand="dir"/);
+  assert.match(text, /<cli>_workspace\(subcommand="list"/);
+  assert.match(text, /<cli>_workspace\(subcommand="stat"/);
+  assert.match(text, /<cli>_workspace\(subcommand="read"/);
 });
 
 // ---------- cleanup ----------

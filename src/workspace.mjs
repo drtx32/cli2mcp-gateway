@@ -1,6 +1,6 @@
 // workspace.mjs — managed single-root read-only workspace runtime.
 //
-// The gateway exposes a synthetic "workspace" tool when a service has
+// The gateway exposes a synthetic `<cli>_workspace` tool when a service has
 // `workspace.path` configured (normal mode + workspace) or when the mode
 // explicitly requires it (triple mode). From the agent's side, the workspace
 // behaves like a small read-only filesystem: dir, list, stat, read. From the
@@ -772,12 +772,14 @@ function looksLikeUtf8(bytes) {
  * one tool covers all four operations. Naming and description are designed
  * to match the existing `<cli>_help` / `<cli>_run` synthetic-tool style.
  */
-export function workspaceToolSpec() {
+export function workspaceToolSpec(toolName) {
+  if (typeof toolName !== "string" || !toolName.endsWith("_workspace")) {
+    throw new Error("workspace tool name must use the <cli>_workspace namespace");
+  }
   return {
-    name: "workspace",
+    name: toolName,
     description:
-      "Gateway meta-tool: read-only access to the managed workspace for this service. " +
-      "Call `workspace(subcommand=\"dir\")` first when you need an output / save / download path — " +
+      `Gateway meta-tool: read-only access to the managed workspace for this service. Call \`${toolName}(subcommand=\"dir\")\` first when you need an output / save / download path — ` +
       "the gateway returns a canonical absolute path you can pass directly to " +
       "downstream CLI flags (e.g. `--output`, `-o`, `--save`). " +
       "Subcommands: dir (returns the canonical workspace root), " +
@@ -809,8 +811,22 @@ export function workspaceToolSpec() {
       required: ["subcommand"],
       additionalProperties: false,
     },
-    dispatch: { kind: "workspace" },
+    dispatch: { kind: "workspace", toolName },
   };
+}
+
+/** Add the workspace tool, failing clearly when a CLI already owns its name. */
+export function appendWorkspaceTool(tools, toolSpec, { checkCliCollision = false } = {}) {
+  const conflict = tools.find((tool) => tool.name === toolSpec.name);
+  if (checkCliCollision && conflict) {
+    throw new Error(
+      `tool name collision on "${toolSpec.name}": real CLI-discovered command ` +
+      `conflicts with gateway synthetic workspace tool. Rename/remove the CLI command ` +
+      `or change the workspace/tool_mode configuration.`,
+    );
+  }
+  tools.push(toolSpec);
+  return tools;
 }
 
 /**
@@ -837,12 +853,12 @@ export async function callWorkspace(runtime, args, deps = {}) {
 
 /**
  * Synthetic workspace help text — what the synthetic `<svc>_help` tool
- * returns when called with commandPath=["workspace"] (or equivalent).
+ * returns when called with commandPath=["<cli>_workspace"] (or equivalent).
  *
  * Describes the four ops, the security model, and the agent workflow. Mirrors
  * the inline style of the gateway's other help output.
  */
-export function workspaceHelpText() {
+export function workspaceHelpText(toolName = "<cli>_workspace") {
   return [
     "Managed workspace for this gateway service.",
     "",
@@ -850,17 +866,17 @@ export function workspaceHelpText() {
     "fetches URLs into this directory and never exposes write/delete/move/copy.",
     "",
     "When to use it:",
-    "  - Call workspace(subcommand=\"dir\") first when you need to pass an --output /",
+    `  - Call ${toolName}(subcommand="dir") first when you need to pass an --output /`,
     "    -o / --save path to the downstream CLI. The returned path is canonical",
     "    and absolute — hand it directly to the CLI flag, do not invent your own.",
     "  - Use list / stat / read to inspect files the CLI or another tool produced",
     "    in the workspace.",
     "",
     "Subcommands:",
-    '  workspace(subcommand="dir")                → { root: "<canonical absolute path>" }',
-    '  workspace(subcommand="list", path?, recursive?) → { entries: [...], truncated, root }',
-    '  workspace(subcommand="stat", path)         → { path, kind, size, mtime, ctime, mode }',
-    '  workspace(subcommand="read", path)         → typed MCP content (text or image block)',
+    `  ${toolName}(subcommand="dir")                → { root: "<canonical absolute path>" }`,
+    `  ${toolName}(subcommand="list", path?, recursive?) → { entries: [...], truncated, root }`,
+    `  ${toolName}(subcommand="stat", path)         → { path, kind, size, mtime, ctime, mode }`,
+    `  ${toolName}(subcommand="read", path)         → typed MCP content (text or image block)`,
     "",
     "Security:",
     "  - .., absolute paths outside the root, and symlinks pointing outside the",
