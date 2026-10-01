@@ -518,7 +518,8 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
     const workspaceTool = workspaceToolSpec(workspaceToolName);
     try {
       appendWorkspaceTool(perServiceTools[serviceName], workspaceTool, {
-        checkCliCollision: svc.adapter === "cli" && workspaceRuntime.toolMode === "normal",
+        toolMode: workspaceRuntime.toolMode,
+        adapter: svc.adapter,
       });
     } catch (err) {
       console.error(`[boot] ${serviceName}: ${err.message}`);

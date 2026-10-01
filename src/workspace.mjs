@@ -815,14 +815,21 @@ export function workspaceToolSpec(toolName) {
   };
 }
 
-/** Add the workspace tool, failing clearly when a CLI already owns its name. */
-export function appendWorkspaceTool(tools, toolSpec, { checkCliCollision = false } = {}) {
+/** Add the workspace tool, failing clearly when an upstream tool already owns its name. */
+export function appendWorkspaceTool(
+  tools,
+  toolSpec,
+  { toolMode = "normal", adapter = "cli" } = {},
+) {
   const conflict = tools.find((tool) => tool.name === toolSpec.name);
-  if (checkCliCollision && conflict) {
+  if (toolMode === "normal" && conflict) {
+    const collisionOrigin = adapter === "cli"
+      ? "real CLI-discovered command"
+      : "upstream-discovered MCP tool";
     throw new Error(
-      `tool name collision on "${toolSpec.name}": real CLI-discovered command ` +
-      `conflicts with gateway synthetic workspace tool. Rename/remove the CLI command ` +
-      `or change the workspace/tool_mode configuration.`,
+      `tool name collision on "${toolSpec.name}": ${collisionOrigin} conflicts with ` +
+      `gateway synthetic workspace tool. Rename/remove the upstream tool or change ` +
+      `the workspace/tool_mode configuration.`,
     );
   }
   tools.push(toolSpec);

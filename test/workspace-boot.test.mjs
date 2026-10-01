@@ -193,11 +193,30 @@ test("boot pipeline: triple mode exposes exactly namespaced help, run, and works
 test("normal mode: exact CLI tool name collision fails with both origins", () => {
   const tools = [{ name: "ashare_workspace", dispatch: { kind: "cli", commandPath: ["workspace"] } }];
   assert.throws(
-    () => appendWorkspaceTool(tools, workspaceToolSpec("ashare_workspace"), { checkCliCollision: true }),
+    () => appendWorkspaceTool(tools, workspaceToolSpec("ashare_workspace"), {
+      toolMode: "normal",
+      adapter: "cli",
+    }),
     /collision on "ashare_workspace": real CLI-discovered command conflicts with gateway synthetic workspace tool/,
   );
   assert.equal(tools.length, 1);
 });
+
+for (const adapter of ["mcp-stdio", "mcp-http"]) {
+  test(`normal ${adapter} mode: upstream workspace collision fails instead of shadowing`, () => {
+    const toolName = "ashare_workspace";
+    const upstreamTools = [{ name: toolName, dispatch: { kind: "upstream" } }];
+    assert.throws(
+      () => appendWorkspaceTool(upstreamTools, workspaceToolSpec(toolName), {
+        toolMode: "normal",
+        adapter,
+      }),
+      new RegExp(`collision on "${toolName}": upstream-discovered MCP tool conflicts with gateway synthetic workspace tool`),
+    );
+    assert.equal(upstreamTools.length, 1);
+    assert.equal(upstreamTools[0].dispatch.kind, "upstream");
+  });
+}
 
 test("workspace help: workspaceHelpText mentions every subcommand and the security model", async () => {
   const { workspaceHelpText } = await import("../src/workspace.mjs");
