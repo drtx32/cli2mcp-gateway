@@ -338,7 +338,7 @@ export function legacyEnvConfig() {
     naming: {},
     transport: { type: "http", host: base.HOST, port: base.PORT, path: "/mcp" },
     auth: {
-      mode: base.AUTH_MODE === "oauth" || base.AUTH_MODE === "auth0" ? base.AUTH_MODE : (base.MCP_TOKEN ? "bearer" : "none"),
+      mode: ["oauth", "auth0", "both"].includes(base.AUTH_MODE) ? base.AUTH_MODE : (base.MCP_TOKEN ? "bearer" : "none"),
       token: base.MCP_TOKEN || undefined,
       env_file: undefined,
       env_var: "MCP_TOKEN",

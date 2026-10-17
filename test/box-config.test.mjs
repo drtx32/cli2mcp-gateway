@@ -31,6 +31,25 @@ test("legacyEnvConfig: defaults to CLI_COMMAND env or 'rg'", () => {
   }
 });
 
+test("legacyEnvConfig: preserves AUTH_MODE=both with or without MCP_TOKEN", () => {
+  const orig = { ...process.env };
+  try {
+    process.env.AUTH_MODE = "both";
+    process.env.MCP_TOKEN = "test-bearer-token";
+
+    const withToken = legacyEnvConfig();
+    assert.equal(withToken.auth.mode, "both");
+    assert.equal(withToken.auth.token, "test-bearer-token");
+
+    delete process.env.MCP_TOKEN;
+    const withoutToken = legacyEnvConfig();
+    assert.equal(withoutToken.auth.mode, "both");
+    assert.equal(withoutToken.auth.token, undefined);
+  } finally {
+    process.env = orig;
+  }
+});
+
 test("legacyEnvConfig: respects CLI_DUAL_TOOL_MODE on the cli service", () => {
   const orig = { ...process.env };
   try {
