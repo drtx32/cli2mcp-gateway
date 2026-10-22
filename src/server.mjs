@@ -1203,7 +1203,9 @@ async function runHttp() {
 
     const authorizationMetadata = (_req, res) => res.json({
       issuer: env.AUTH0_ISSUER ? `${env.AUTH0_ISSUER}/` : env.OAUTH_ISSUER,
-      authorization_endpoint: `${env.AUTH0_ISSUER || env.OAUTH_ISSUER}/authorize`,
+      authorization_endpoint: env.AUTH0_ISSUER
+        ? `${env.AUTH0_ISSUER}/authorize`
+        : `${env.OAUTH_ISSUER}/oauth/authorize`,
       token_endpoint: `${env.AUTH0_ISSUER || env.OAUTH_ISSUER}/oauth/token`,
       ...(env.AUTH0_ISSUER
         ? { registration_endpoint: `${env.AUTH0_ISSUER}/oidc/register` }
