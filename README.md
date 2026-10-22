@@ -62,9 +62,21 @@ npm start
 
 ### Option B: global install + env vars on the command line (no .env file)
 
+After the first npm release:
+
+```bash
+npm install -g cli2mcp-gateway
+```
+
+Before the npm package is bootstrapped, install directly from GitHub:
+
 ```bash
 npm install -g drtx32/cli2mcp-gateway
+```
 
+Then start it with env vars inline:
+
+```bash
 # one-shot start with env inline:
 MCP_TOKEN=ph_token_12345678 \
 CLI_COMMAND=parsehub \
@@ -129,6 +141,16 @@ curl -X POST http://127.0.0.1:3101/mcp \
   -H "Authorization: Bearer $MCP_TOKEN" -H "mcp-session-id: $SID" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":2}'
 ```
+
+---
+
+## Releases
+
+CI runs the test suite on Node.js 22 and 24 for pull requests and pushes to `main`.
+Pushing a `v*` tag runs the release checks and publishes the matching package version
+to npm through GitHub Actions trusted publishing (OIDC). The initial npm publication
+and trusted-publisher setup are documented in [docs/releasing.md](docs/releasing.md).
+The npm publish workflow does not require a GitHub Deployment or a long-lived npm token.
 
 ---
 
