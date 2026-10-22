@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openOAuthClientStore } from '../src/oauth-client-store.mjs';
@@ -33,6 +33,33 @@ test('OAuth client store fails initialization when its parent path is not a dire
   writeFileSync(parentFile, '');
   try {
     assert.throws(() => openOAuthClientStore(join(parentFile, 'clients.json')), /cannot initialize/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('OAuth client store restricts existing file permissions before loading it', { skip: process.platform === 'win32' }, () => {
+  const directory = mkdtempSync(join(tmpdir(), 'oauth-store-'));
+  const storePath = join(directory, 'clients.json');
+  try {
+    writeFileSync(storePath, JSON.stringify({ formatVersion: 1, clients: [] }), { mode: 0o666 });
+    chmodSync(storePath, 0o644);
+    openOAuthClientStore(storePath);
+    assert.equal(statSync(storePath).mode & 0o777, 0o600);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('OAuth client store rejects malformed client names without changing persisted data', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'oauth-store-'));
+  const storePath = join(directory, 'clients.json');
+  try {
+    const store = openOAuthClientStore(storePath);
+    const original = readFileSync(storePath, 'utf8');
+    assert.throws(() => store.save('client_test', { clientName: { invalid: true }, redirectUris: ['https://client.example/callback'] }), /Invalid OAuth client registration/);
+    assert.throws(() => store.save('client_test', { clientName: 'x'.repeat(129), redirectUris: ['https://client.example/callback'] }), /Invalid OAuth client registration/);
+    assert.equal(readFileSync(storePath, 'utf8'), original);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

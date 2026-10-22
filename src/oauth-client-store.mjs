@@ -3,6 +3,14 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, 
 import { dirname, resolve } from "node:path";
 
 const FORMAT_VERSION = 1;
+export const MAX_OAUTH_CLIENT_NAME_LENGTH = 128;
+
+export function isValidOAuthClientName(clientName) {
+  return typeof clientName === "string"
+    && clientName.length > 0
+    && clientName.length <= MAX_OAUTH_CLIENT_NAME_LENGTH
+    && clientName.trim().length > 0;
+}
 
 function fail(path, message, cause) {
   const error = new Error(`OAuth client store ${path}: ${message}`, { cause });
@@ -12,15 +20,27 @@ function fail(path, message, cause) {
 
 function validClient(client) {
   return client && typeof client.clientId === "string" && client.clientId.startsWith("client_")
-    && typeof client.clientName === "string" && Array.isArray(client.redirectUris)
+    && isValidOAuthClientName(client.clientName) && Array.isArray(client.redirectUris)
     && client.redirectUris.length > 0 && client.redirectUris.every(uri => typeof uri === "string")
     && Number.isSafeInteger(client.issuedAt) && client.issuedAt > 0;
 }
 
 function readStore(path) {
+  let stat;
   try {
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("expected a regular, non-symlink file");
+    stat = lstatSync(path);
+  } catch (error) {
+    throw fail(path, "cannot inspect file", error);
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw fail(path, "expected a regular, non-symlink file");
+  }
+  try {
+    chmodSync(path, 0o600);
+  } catch (error) {
+    throw fail(path, "cannot secure file permissions", error);
+  }
+  try {
     const data = JSON.parse(readFileSync(path, "utf8"));
     if (data?.formatVersion !== FORMAT_VERSION || !Array.isArray(data.clients)
         || !data.clients.every(validClient)
@@ -56,14 +76,15 @@ export function openOAuthClientStore(filePath, { maxAgeDays = 3650, now = Date.n
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     if (!existsSync(path)) writeStore(path, []);
     const clients = readStore(path);
-    chmodSync(path, 0o600);
     const maxAgeMs = maxAgeDays * 86400_000;
     const active = clients.filter(client => client.issuedAt <= now && now - client.issuedAt < maxAgeMs);
     if (active.length !== clients.length) writeStore(path, active);
     return {
       clients: new Map(active.map(({ clientId, clientName, redirectUris }) => [clientId, { clientName, redirectUris } ])),
       save(clientId, { clientName, redirectUris }, issuedAt = Date.now()) {
-        const next = [...active.filter(client => client.clientId !== clientId), { clientId, clientName, redirectUris, issuedAt }];
+        const record = { clientId, clientName, redirectUris, issuedAt };
+        if (!validClient(record)) throw new TypeError("Invalid OAuth client registration");
+        const next = [...active.filter(client => client.clientId !== clientId), record];
         writeStore(path, next);
         active.splice(0, active.length, ...next);
       },

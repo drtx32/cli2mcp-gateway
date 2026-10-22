@@ -71,6 +71,16 @@ test('persisted OAuth client registration remains authorized after gateway resta
     });
     assert.equal(registration.status, 201);
     const registered = await registration.json();
+
+    const originalStore = readFileSync(storePath, 'utf8');
+    for (const clientName of [null, { unexpected: 'object' }]) {
+      const malformed = await fetch(`http://127.0.0.1:${port}/oauth/register`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ client_name: clientName, redirect_uris: [redirectUri] }),
+      });
+      assert.equal(malformed.status, 400);
+      assert.equal(readFileSync(storePath, 'utf8'), originalStore);
+    }
     await stopGateway(child);
 
     assert.equal(statSync(storePath).mode & 0o777, 0o600);

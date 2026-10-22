@@ -16,7 +16,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { openOAuthClientStore } from "./oauth-client-store.mjs";
+import { isValidOAuthClientName, openOAuthClientStore } from "./oauth-client-store.mjs";
 import express from "express";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -1230,8 +1230,10 @@ async function runHttp() {
     app.post("/oauth/register", (req, res) => {
       const { redirect_uris: redirectUris, client_name: clientName = "MCP client" } = req.body || {};
       if (!validRedirectUris(redirectUris)) return res.status(400).json({ error: "invalid_redirect_uri" });
+      if (!isValidOAuthClientName(clientName)) return res.status(400).json({ error: "invalid_client_metadata" });
+      const normalizedClientName = clientName.trim();
       const clientId = `client_${randomBytes(18).toString("base64url")}`;
-      const client = { clientName, redirectUris };
+      const client = { clientName: normalizedClientName, redirectUris };
       if (clientStore) {
         try { clientStore.save(clientId, client); }
         catch (error) {
@@ -1243,7 +1245,7 @@ async function runHttp() {
       res.status(201).json({
         client_id: clientId,
         client_id_issued_at: Math.floor(Date.now() / 1000),
-        client_name: clientName,
+        client_name: normalizedClientName,
         redirect_uris: redirectUris,
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
