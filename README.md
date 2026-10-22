@@ -193,6 +193,8 @@ All config flows through environment variables. See `.env.example` for the full 
 | `CLI_TIMEOUT_MS` | `60000` | Per-call CLI timeout (execa). |
 | `PUBLIC_ENDPOINT` | `http://$HOST:$PORT` | Required `https://...` when OAuth enabled |
 | `OAUTH_USERNAME` / `OAUTH_PASSWORD` | `admin` / `change-me` | **Replace before any non-local use** |
+| `OAUTH_CLIENT_STORE_PATH` | (empty; memory only) | Optional path for the built-in OAuth dynamic client registry. Set to a persistent local file to retain `client_id`, client name, redirect URIs, and registration time across restarts. |
+| `OAUTH_CLIENT_MAX_AGE_DAYS` | `3650` | Expire and remove persisted registrations older than this many days at startup. |
 | `AUTH0_ISSUER` / `AUTH0_AUDIENCE` | (empty) | Enables Auth0 JWT verification |
 | `ALLOWED_HOSTS` | (empty) | Host header allowlist (anti-DNS-rebinding) |
 | `MCP_ALLOWED_IPS` | (empty) | Source-IP allowlist. Comma-separated. Accepts bare IP (`1.2.3.4`), IP:port (`1.2.3.4:3101`), CIDR (`10.0.0.0/8`), and IPv6. Empty = allow all. |
@@ -209,6 +211,31 @@ All config flows through environment variables. See `.env.example` for the full 
 - **Auth0** — add `AUTH0_ISSUER` + `AUTH0_AUDIENCE` to verify Auth0 JWTs alongside the others.
 
 OAuth is required to be served over HTTPS in non-localhost deployments; the gateway refuses to start otherwise.
+
+### Persisting OAuth client registrations
+
+The default remains in-memory registration. To keep dynamic client registrations
+across restarts, set `OAUTH_CLIENT_STORE_PATH`, for example:
+
+```sh
+mkdir -p ./data
+chmod 700 ./data
+OAUTH_CLIENT_STORE_PATH=./data/oauth-clients.json npm start
+```
+
+The path is resolved from the gateway's working directory. The gateway creates
+the file with owner-only permissions (`0600`), writes updates atomically, and
+fails to start if the file is unreadable, malformed, or cannot be written. The
+versioned format currently uses version 1; back it up while the gateway is
+stopped, keep backups access-controlled, and restore only trusted copies.
+Registrations expire after `OAUTH_CLIENT_MAX_AGE_DAYS` (10 years by default)
+and expired entries are removed at startup. Keep the store on durable local
+storage and include it in your protected backup routine if clients must survive
+host replacement.
+
+Only client registrations are persisted. Authorization codes, access tokens,
+and refresh tokens remain memory-only and are invalidated when the gateway
+restarts; clients must complete authorization again after a restart.
 
 ## Multi-service `box.yaml` mode
 

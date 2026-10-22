@@ -16,6 +16,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { openOAuthClientStore } from "./oauth-client-store.mjs";
 import express from "express";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -63,6 +64,8 @@ const env = {
 // AUTH_MODE=bearer. Check is lazy and only fires when oauth is actually used.
   OAUTH_USERNAME:    process.env.OAUTH_USERNAME || "admin",
   OAUTH_PASSWORD:    process.env.OAUTH_PASSWORD || "", // Empty default; validated below in `resolveOAuthPassword()`.
+  OAUTH_CLIENT_STORE_PATH: process.env.OAUTH_CLIENT_STORE_PATH || "",
+  OAUTH_CLIENT_MAX_AGE_DAYS: Number(process.env.OAUTH_CLIENT_MAX_AGE_DAYS || 3650),
   ALLOWED_HOSTS:     (process.env.ALLOWED_HOSTS || "").split(",").map(v => v.trim()).filter(Boolean),
   // IP allowlist. Comma-separated, accepts bare IP or IP:port.
   // Examples: "161.33.195.100" or "161.33.195.100:3101,10.0.0.0/8".
@@ -950,7 +953,10 @@ async function runStdio() {
 
 async function runHttp() {
   // ----- 5.1 OAuth / Auth0 state -----
-  const oauthClients = new Map();
+  const clientStore = openOAuthClientStore(env.OAUTH_CLIENT_STORE_PATH, {
+    maxAgeDays: env.OAUTH_CLIENT_MAX_AGE_DAYS,
+  });
+  const oauthClients = clientStore?.clients || new Map();
   const authorizationCodes = new Map();
   const oauthTokens = new Map();
 
@@ -1225,7 +1231,15 @@ async function runHttp() {
       const { redirect_uris: redirectUris, client_name: clientName = "MCP client" } = req.body || {};
       if (!validRedirectUris(redirectUris)) return res.status(400).json({ error: "invalid_redirect_uri" });
       const clientId = `client_${randomBytes(18).toString("base64url")}`;
-      oauthClients.set(clientId, { clientName, redirectUris });
+      const client = { clientName, redirectUris };
+      if (clientStore) {
+        try { clientStore.save(clientId, client); }
+        catch (error) {
+          console.error(`[oauth] client registration persistence failed: ${error.message}`);
+          return res.status(500).json({ error: "server_error" });
+        }
+      }
+      oauthClients.set(clientId, client);
       res.status(201).json({
         client_id: clientId,
         client_id_issued_at: Math.floor(Date.now() / 1000),
