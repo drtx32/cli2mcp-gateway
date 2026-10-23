@@ -2,6 +2,7 @@
 
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { pickUpstreamToolMeta } from "../tool-aggregator.mjs";
 
 /**
  * Connect to an upstream MCP HTTP endpoint, cache its tools, and expose a
@@ -31,10 +32,16 @@ export async function discoverHttpMcp(cfg) {
   const { tools } = await client.listTools();
 
   return {
+    // Keep the descriptive metadata the upstream advertised, not just the
+    // three fields the gateway used to copy. Downstream clients need `title`,
+    // `annotations` and `outputSchema` to render and validate calls correctly.
+    // Capability declarations (`execution`) are deliberately NOT kept — see
+    // UPSTREAM_TOOL_META_FIELDS.
     tools: tools.map(t => ({
       name: t.name,
       description: t.description ?? "",
       inputSchema: t.inputSchema ?? { type: "object", properties: {} },
+      ...pickUpstreamToolMeta(t),
     })),
     client,
     close: () => client.close(),

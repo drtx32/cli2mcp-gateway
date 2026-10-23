@@ -13,6 +13,7 @@
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { buildServiceEnv } from "../service-env.mjs";
+import { pickUpstreamToolMeta } from "../tool-aggregator.mjs";
 
 /**
  * Discover the tool list of an upstream stdio MCP server.
@@ -44,10 +45,13 @@ export async function discoverStdioMcp(cfg) {
   const { tools } = await client.listTools();
 
   return {
+    // Keep the descriptive metadata the upstream advertised, not just the
+    // three fields the gateway used to copy — see adapters/mcp-http.mjs.
     tools: tools.map(t => ({
       name: t.name,
       description: t.description ?? "",
       inputSchema: t.inputSchema ?? { type: "object", properties: {} },
+      ...pickUpstreamToolMeta(t),
     })),
     client,
     close: () => client.close(),
