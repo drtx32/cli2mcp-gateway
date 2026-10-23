@@ -45,7 +45,7 @@ export async function discoverStdioMcp(cfg) {
   const { tools } = await client.listTools();
 
   return {
-    // Keep everything the upstream advertised about the tool, not just the
+    // Keep the descriptive metadata the upstream advertised, not just the
     // three fields the gateway used to copy — see adapters/mcp-http.mjs.
     tools: tools.map(t => ({
       name: t.name,

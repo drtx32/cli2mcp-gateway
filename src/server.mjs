@@ -755,10 +755,12 @@ function createServer() {
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // Forward whatever the owning upstream advertised alongside the tool
-    // (title / outputSchema / annotations / icons / execution / _meta) on top of
-    // the three core fields. pickUpstreamToolMeta never returns `name`,
-    // `inputSchema` or `dispatch`, so the gateway-internal routing hint stays
-    // private while a downstream client still sees the full tool contract.
+    // (title / outputSchema / annotations / icons / _meta) on top of the three
+    // core fields. pickUpstreamToolMeta never returns `name`, `inputSchema` or
+    // `dispatch`, so the gateway-internal routing hint stays private while a
+    // downstream client still sees the full tool contract. It also never
+    // returns `execution` — see UPSTREAM_TOOL_META_FIELDS for why a task
+    // support declaration must not be proxied we cannot honour.
     tools: tools.map((tool) => ({
       name: tool.name,
       description: tool.description,

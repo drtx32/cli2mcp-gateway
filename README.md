@@ -271,8 +271,18 @@ Tool names are qualified per service by `naming.collision_policy`:
 
 An identically-named tool on two upstreams is therefore never shadowed: each
 downstream id maps back to exactly one adapter. `tools/list` also forwards each
-upstream's own `title`, `outputSchema`, `annotations` and `_meta`, so a
+upstream's own `title`, `outputSchema`, `annotations`, `icons` and `_meta`, so a
 downstream client sees the full tool contract, not just name/description/schema.
+
+Fields that change *how a tool must be invoked* are deliberately **not**
+forwarded. In particular `execution.taskSupport` is withheld: the gateway
+advertises `capabilities: { tools: {} }`, forwards only `{name, arguments}` on
+`tools/call` and proxies no task lifecycle, so echoing a `required`/`optional`
+task declaration would promise a capability it does not have — and the official
+MCP SDK client would then refuse those tools locally without ever sending a
+request. A `taskSupport: required` upstream is still listed, but calling it
+reports a plain error rather than succeeding. Full task support is a separate
+feature.
 
 **Boot is fail-closed.** If any upstream cannot be reached, or returns an auth
 error at boot, the gateway exits non-zero and logs which service failed — it

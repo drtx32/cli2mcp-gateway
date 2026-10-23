@@ -32,9 +32,11 @@ export async function discoverHttpMcp(cfg) {
   const { tools } = await client.listTools();
 
   return {
-    // Keep everything the upstream advertised about the tool, not just the
+    // Keep the descriptive metadata the upstream advertised, not just the
     // three fields the gateway used to copy. Downstream clients need `title`,
     // `annotations` and `outputSchema` to render and validate calls correctly.
+    // Capability declarations (`execution`) are deliberately NOT kept — see
+    // UPSTREAM_TOOL_META_FIELDS.
     tools: tools.map(t => ({
       name: t.name,
       description: t.description ?? "",

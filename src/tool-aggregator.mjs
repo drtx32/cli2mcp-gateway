@@ -40,16 +40,36 @@
  * MCP `Tool` fields the gateway forwards from an upstream catalog to the
  * downstream `tools/list` verbatim.
  *
- * `name` is deliberately absent — downstream sees the *qualified* name — and so
- * is `inputSchema` (kept as its own first-class field) and `dispatch`, which is
- * gateway-internal routing state that must never be published.
+ * Everything listed here is inert description or hint data: it changes how a
+ * tool is *presented*, never how it must be *invoked*. That line is the whole
+ * rule, because the gateway is not a transparent proxy for every MCP feature —
+ * it advertises `capabilities: { tools: {} }`, forwards only `{name, arguments}`
+ * on `tools/call`, and registers no handlers beyond the tool surface. So a field
+ * that participates in capability negotiation must stay off this list until the
+ * gateway actually implements the feature end to end.
+ *
+ * `execution` is deliberately absent. It carries `taskSupport`
+ * ("required" | "optional" | "forbidden"), which is a contract about *how* a
+ * client must invoke the tool. Forwarding it makes the gateway advertise task
+ * support it does not have: it never forwards `params.task` and proxies no
+ * task lifecycle (`tasks/result`, `tasks/get`, `tasks/cancel`). The failure is
+ * not cosmetic — the official SDK client caches `taskSupport === "required"`
+ * from `tools/list` and then `callTool()` refuses locally without sending a
+ * request, so the tool becomes permanently unreachable through this gateway.
+ * Strip the declaration and the same client call works.
+ *
+ * Also not forwardable:
+ *   - `name` — downstream sees the *qualified* name, never the upstream's.
+ *   - `inputSchema` — kept as its own first-class field.
+ *   - `dispatch` — gateway-internal routing state that must never be published.
  *
  * These are all spec-defined MCP `Tool` members, so copying them is lossless
  * for any conformant upstream and a no-op for adapters that declare none (e.g.
- * the help-derived `cli` catalog).
+ * the help-derived `cli` catalog). The allowlist shape also means a future SDK
+ * field is simply not forwarded until someone adds it deliberately.
  */
 export const UPSTREAM_TOOL_META_FIELDS = [
-  "title", "outputSchema", "annotations", "icons", "execution", "_meta",
+  "title", "outputSchema", "annotations", "icons", "_meta",
 ];
 
 /**
