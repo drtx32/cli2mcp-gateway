@@ -1,0 +1,77 @@
+# Multi-upstream MCP aggregation — copy-paste example (ELI-467)
+#
+# One box.yaml, one externally exposed MCP endpoint, two upstream MCP servers
+# combined. Every URL and token below is a DUMMY placeholder — replace them
+# with your own values (ideally via ${VAR} expansion or an env_file) before
+# deploying.
+#
+#   cli2mcp-gateway serve --config ./box.yaml --http
+#
+# Then point one MCP client at http://127.0.0.1:3100/mcp and call the
+# namespaced tools listed at the bottom of this file.
+
+name: two-upstream-example
+
+services:
+
+  # ---- upstream A: a remote Streamable HTTP MCP server --------------------
+  # Its tools are exposed as `alpha__<tool>`.
+  alpha:
+    adapter: mcp-http
+    url: https://mcp-alpha.example.invalid/mcp
+    timeout_ms: 30000
+    max_output_bytes: 64000
+    auth:
+      type: bearer
+      # Prefer ${VAR} expansion (declare it under top-level `env`/`env_file`)
+      # over a literal token in the file.
+      token: ${ALPHA_MCP_TOKEN}
+    headers:
+      # Anything else the upstream needs, as plain request headers.
+      X-Tenant-Id: example-tenant
+
+  # ---- upstream B: a local stdio MCP server --------------------------------
+  # Its tools are exposed as `beta__<tool>`.
+  beta:
+    adapter: mcp-stdio
+    command: npx
+    args: [-y, example-mcp-server]
+    cwd: /opt/example-mcp-server
+    timeout_ms: 30000
+    env:
+      # Passed to the child process on top of the gateway's own environment.
+      EXAMPLE_API_KEY: ${BETA_API_KEY}
+
+# Naming rules for the merged catalog.
+naming:
+  separator: __
+  # prefix_upstream (default) | suffix_upstream | error
+  collision_policy: prefix_upstream
+  # Optional box-wide prefix, applied in front of every qualified name.
+  # prefix: "gw."
+  # Only unwrap when the box has EXACTLY one service — this keeps legacy
+  # single-service deployments on their original raw tool names. Leave it
+  # off (the default) for any multi-service box.
+  auto_unwrap_single_service: false
+
+transport:
+  type: http
+  host: 127.0.0.1
+  port: 3100
+  path: /mcp
+
+auth:
+  # Inbound auth for THIS gateway. Independent of each upstream's own auth.
+  mode: bearer
+  env_var: MCP_TOKEN
+
+health:
+  path: /health
+
+# Resulting downstream tool names, if upstream A exposes `search` and
+# `fetch_url` and upstream B exposes `search` too:
+#
+#   alpha__search      alpha__fetch_url      beta__search
+#
+# An identically-named tool on two upstreams is qualified, never shadowed —
+# each name dispatches to exactly one adapter.

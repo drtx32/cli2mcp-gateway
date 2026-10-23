@@ -254,6 +254,36 @@ inbound adapters:
 - `auto` — probe the command as MCP stdio first (including a conventional
   `mcp` subcommand), then fall back to the help-driven `cli` adapter.
 
+### Aggregating several MCP upstreams
+
+One `box.yaml` with several `mcp-http` / `mcp-stdio` / `cli` services becomes
+one externally exposed MCP endpoint serving the union of every upstream's tools.
+See [`docs/multi-upstream-mcp-example.yaml`](docs/multi-upstream-mcp-example.yaml)
+for a copy-paste two-upstream config.
+
+Tool names are qualified per service by `naming.collision_policy`:
+
+| Policy | `ping` on services `alpha` and `beta` becomes |
+|---|---|
+| `prefix_upstream` (default) | `alpha__ping`, `beta__ping` |
+| `suffix_upstream` | `ping__alpha`, `ping__beta` |
+| `error` | boot fails, naming the colliding id |
+
+An identically-named tool on two upstreams is therefore never shadowed: each
+downstream id maps back to exactly one adapter. `tools/list` also forwards each
+upstream's own `title`, `outputSchema`, `annotations` and `_meta`, so a
+downstream client sees the full tool contract, not just name/description/schema.
+
+**Boot is fail-closed.** If any upstream cannot be reached, or returns an auth
+error at boot, the gateway exits non-zero and logs which service failed — it
+never starts up serving a silently smaller catalog, and it never hides an
+unknown upstream credential failure. After boot, a *tool call* failure stays
+local to its own upstream: the other services keep answering.
+
+> `timeout_ms` bounds `cli` adapter calls only. `mcp-http` / `mcp-stdio` calls
+> use the MCP SDK's 60s default, so a wedged upstream holds that one tool call
+> (not the endpoint) until it settles.
+
 ### Tool exposure mode (`tool_mode`)
 
 Each `cli` / `auto` / `mcp-stdio` / `mcp-http` service can declare how the
@@ -443,6 +473,7 @@ cli2mcp-gateway/
 │   └── adapters/           # mcp-stdio / mcp-http upstream adapters
 ├── test/                    # node --test specs
 ├── test-fixtures/          # stub MCP servers for e2e tests
+├── docs/                   # multi-upstream example config, release notes
 ├── .env.example
 ├── .gitignore
 ├── package.json

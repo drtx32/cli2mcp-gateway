@@ -31,7 +31,7 @@ import {
 import { execa } from "execa";
 import { discoverTools, buildArgv, captureHelp, parseSubcommandNames } from "./help-parser.js";
 import { loadBoxConfig, legacyEnvConfig, configSummary } from "./box-config.mjs";
-import { aggregateTools, buildDispatchTable, resolveToolCall } from "./tool-aggregator.mjs";
+import { aggregateTools, buildDispatchTable, pickUpstreamToolMeta, resolveToolCall } from "./tool-aggregator.mjs";
 import { discoverStdioMcp, isStdioMcp } from "./adapters/mcp-stdio.mjs";
 import { discoverHttpMcp } from "./adapters/mcp-http.mjs";
 import { buildServiceEnv } from "./service-env.mjs";
@@ -754,7 +754,17 @@ function createServer() {
     { capabilities: { tools: {} } },
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    // Forward whatever the owning upstream advertised alongside the tool
+    // (title / outputSchema / annotations / icons / execution / _meta) on top of
+    // the three core fields. pickUpstreamToolMeta never returns `name`,
+    // `inputSchema` or `dispatch`, so the gateway-internal routing hint stays
+    // private while a downstream client still sees the full tool contract.
+    tools: tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      ...pickUpstreamToolMeta(tool),
+    })),
   }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: callArgs = {} } = request.params;
