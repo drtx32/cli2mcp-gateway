@@ -38,8 +38,8 @@ test("preserves non-text blocks and error state", () => {
 
 test("ordinary output, malformed JSON, and invalid envelope shape fall back to text", () => {
   assert.equal(parseMcpEnvelope("ordinary CLI output"), null);
-  assert.equal(parseMcpEnvelope('{"isMcpEnvelope":true,"result":'), null);
-  assert.equal(parseMcpEnvelope(JSON.stringify({ isMcpEnvelope: true, result: { content: "bad" } })), null);
+  assert.throws(() => parseMcpEnvelope('{"isMcpEnvelope":true,"result":'), { code: "invalid_mcp_envelope" });
+  assert.throws(() => parseMcpEnvelope(JSON.stringify({ isMcpEnvelope: true, result: { content: "bad" } })), { code: "invalid_mcp_envelope" });
   assert.equal(parseMcpEnvelope(JSON.stringify({ isMcpEnvelope: false, result: { content: [] } })), null);
 });
 

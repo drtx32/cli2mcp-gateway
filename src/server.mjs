@@ -321,6 +321,77 @@ const perServiceWorkspace = {};
 const perServiceWorkspaceToolName = {};
 const perServiceUpstreamMcpTools = {};
 
+function cliFailure(kind, message, details = {}) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: message }],
+    structuredContent: { error: kind, recoverable: kind !== "invalid_utf8", ...details },
+  };
+}
+
+function outputStats(text) {
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return {}; }
+  const bodies = [];
+  const addBody = (value) => {
+    if (typeof value === "string") bodies.push(createHash("sha256").update(value).digest("hex"));
+  };
+  if (parsed && !Array.isArray(parsed)) addBody(parsed.content);
+  const files = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.files) ? parsed.files : [];
+  for (const file of files) addBody(file?.content);
+  return {
+    fileCount: files.length,
+    bodySha256: bodies,
+    stdoutSha256: createHash("sha256").update(text).digest("hex"),
+  };
+}
+
+function jsonOutputRequested(args) {
+  return Array.isArray(args) && args.some((arg, i) =>
+    arg === "--output=json" || (arg === "--output" && args[i + 1] === "json"));
+}
+
+function cliOutputChunk(buffer, text, offset, requestedLimit, maxOutputBytes, diagnostics) {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > buffer.length) {
+    return cliFailure("invalid_output_offset", "output_offset must be a valid byte offset in the command output.", {
+      stdoutBytes: buffer.length, maxOutputBytes, recoverable: false,
+    });
+  }
+  const limit = Math.min(
+    Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? requestedLimit : maxOutputBytes,
+    maxOutputBytes,
+  );
+  if (offset < buffer.length && (buffer[offset] & 0xc0) === 0x80) {
+    return cliFailure("invalid_output_offset", "output_offset must start at a UTF-8 character boundary.", {
+      stdoutBytes: buffer.length, maxOutputBytes, recoverable: true,
+    });
+  }
+  let end = Math.min(offset + limit, buffer.length);
+  while (end < buffer.length && (buffer[end] & 0xc0) === 0x80) end--;
+  if (end === offset && offset < buffer.length) {
+    return cliFailure("output_limit_too_small", "output_limit is too small to fit one UTF-8 character.", {
+      stdoutBytes: buffer.length, maxOutputBytes, recoverable: false,
+    });
+  }
+  const chunk = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(offset, end));
+  return {
+    content: [{ type: "text", text: chunk }],
+    structuredContent: {
+      outputChunk: true,
+      byteOffset: offset,
+      byteLength: end - offset,
+      totalBytes: buffer.length,
+      nextOffset: end,
+      complete: end === buffer.length,
+      stdoutSha256: createHash("sha256").update(buffer).digest("hex"),
+      stdoutBytes: buffer.length,
+      ...diagnostics,
+      ...outputStats(text),
+    },
+    isError: false,
+  };
+}
+
 const boxConfigDir = box.path ? dirname(resolve(box.path)) : process.cwd();
 
 /**
@@ -704,43 +775,83 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
     const commandPath = Array.isArray(callArgs.commandPath) ? callArgs.commandPath : [];
     if (commandPath.length > 0) argv.push(...commandPath);
     if (Array.isArray(callArgs.args)) argv.push(...callArgs.args);
-    const r = await execa(svc.command, argv, {
-      cwd: serviceCwd,
-      timeout: serviceTimeout,
-      reject: false,
-      env: serviceEnv,
-      extendEnv: false,
-      input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
-    });
+    const startedAt = process.hrtime.bigint();
+    let r;
+    try {
+      r = await execa(svc.command, argv, {
+        cwd: serviceCwd,
+        timeout: serviceTimeout,
+        reject: false,
+        env: serviceEnv,
+        extendEnv: false,
+        encoding: "buffer",
+        input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
+      });
+    } catch (error) {
+      const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      if (error.timedOut || error.code === "ETIMEDOUT") {
+        const timeoutStdout = Buffer.isBuffer(error.stdout) ? error.stdout.length : Buffer.byteLength(error.stdout || "");
+        const timeoutStderr = Buffer.isBuffer(error.stderr) ? error.stderr.length : Buffer.byteLength(error.stderr || "");
+        return cliFailure("timeout", `Command timed out after ${serviceTimeout} ms; retry with a narrower request.`, {
+          timeoutMs: serviceTimeout,
+          elapsedMs: Math.round(elapsedMs),
+          stdoutBytes: timeoutStdout,
+          stderrBytes: timeoutStderr,
+          exitCode: error.exitCode ?? null,
+          recoverable: true,
+        });
+      }
+      throw error;
+    }
+    const elapsedMs = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
+    const stdoutBuffer = Buffer.isBuffer(r.stdout) ? r.stdout : Buffer.from(r.stdout || "");
+    const stderrBuffer = Buffer.isBuffer(r.stderr) ? r.stderr : Buffer.from(r.stderr || "");
+    const stdoutBytes = stdoutBuffer.length;
+    const stderrBytes = stderrBuffer.length;
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(stdoutBuffer);
+    } catch {
+      return cliFailure("invalid_utf8", "Command output is not valid UTF-8; retry with a text or JSON output mode.", {
+        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+      });
+    }
+    if (r.timedOut) {
+      return cliFailure("timeout", `Command timed out after ${serviceTimeout} ms; retry with a narrower request.`, {
+        timeoutMs: serviceTimeout, stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs, recoverable: true,
+      });
+    }
     if (r.exitCode !== 0) {
-      const errText = (r.stderr || r.stdout || "").trim();
-      return {
-        isError: true,
-        content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
-      };
+      return cliFailure("command_failed", `Command failed with exit code ${r.exitCode}.`, {
+        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+      });
     }
-    const text = r.stdout || "";
-    const lines = text.split(/\r?\n/);
-    let envelopeLine = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      if (line.endsWith("}")) { envelopeLine = line; break; }
-      break;
+    if (stdoutBytes > serviceMaxBytes) {
+      if (callArgs.output_offset !== undefined) {
+        return cliOutputChunk(stdoutBuffer, text, callArgs.output_offset, callArgs.output_limit, serviceMaxBytes, {
+          stderrBytes, exitCode: r.exitCode, elapsedMs,
+        });
+      }
+      return cliFailure("output_limit", `Command output is ${stdoutBytes} bytes; limit is ${serviceMaxBytes}. Retry with a narrower request.`, {
+        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+        maxOutputBytes: serviceMaxBytes, recoverable: true,
+        nextParameters: { output_offset: 0, output_limit: serviceMaxBytes },
+        ...outputStats(text),
+      });
     }
-    if (envelopeLine && envelopeLine.includes('"isMcpEnvelope"') && envelopeLine.includes("true")) {
-      try {
-        const parsed = JSON.parse(envelopeLine);
-        const envResult = parsed.result || {};
-        return {
-          content: envResult.content || [],
-          ...(envResult.structuredContent !== undefined
-            ? { structuredContent: envResult.structuredContent }
-            : {}),
-          isError: Boolean(envResult.isError),
-        };
-      } catch {
-        // Fall through to text path on parse error.
+    try {
+      const envelope = parseMcpEnvelope(text);
+      if (envelope) return envelope;
+    } catch {
+      return cliFailure("invalid_mcp_envelope", "Command returned a malformed MCP result envelope.", {
+        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+      });
+    }
+    if (jsonOutputRequested(callArgs.args)) {
+      try { JSON.parse(text); } catch {
+        return cliFailure("invalid_json", "Command was asked for JSON but returned malformed JSON.", {
+          stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+        });
       }
     }
     return { content: [{ type: "text", text }] };
@@ -879,33 +990,78 @@ function createServer() {
       : (tool.dispatch.subcommand ? [tool.dispatch.subcommand] : []);
     if (commandPath.length > 0) argv.push(...commandPath);
     argv.push(...buildArgv(tool.dispatch.shape, callArgs));
-    const r = await execa(svc.command, argv, {
+    const startedAt = process.hrtime.bigint();
+    let r;
+    try {
+      r = await execa(svc.command, argv, {
         cwd: serviceCwd,
         timeout: serviceTimeout,
         reject: false,
         env: serviceEnv,
         extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
+        encoding: "buffer",
         input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
+      });
+    } catch (error) {
+      const elapsedMs = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
+      if (error.timedOut || error.code === "ETIMEDOUT") {
+        const timeoutStdout = Buffer.isBuffer(error.stdout) ? error.stdout.length : Buffer.byteLength(error.stdout || "");
+        const timeoutStderr = Buffer.isBuffer(error.stderr) ? error.stderr.length : Buffer.byteLength(error.stderr || "");
+        return cliFailure("timeout", `Command timed out after ${serviceTimeout} ms; retry with narrower arguments.`, {
+          timeoutMs: serviceTimeout, elapsedMs, stdoutBytes: timeoutStdout, stderrBytes: timeoutStderr,
+          exitCode: error.exitCode ?? null, recoverable: true,
+        });
       }
-    );
+      throw error;
+    }
+    const elapsedMs = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
+    const stdoutBuffer = Buffer.isBuffer(r.stdout) ? r.stdout : Buffer.from(r.stdout || "");
+    const stderrBuffer = Buffer.isBuffer(r.stderr) ? r.stderr : Buffer.from(r.stderr || "");
+    const stdoutBytes = stdoutBuffer.length;
+    const stderrBytes = stderrBuffer.length;
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(stdoutBuffer);
+    } catch {
+      return cliFailure("invalid_utf8", "Command output is not valid UTF-8.", {
+        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+      });
+    }
+    if (r.timedOut) {
+      return cliFailure("timeout", `Command timed out after ${serviceTimeout} ms; retry with narrower arguments.`, {
+        timeoutMs: serviceTimeout, stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs, recoverable: true,
+      });
+    }
     if (r.exitCode !== 0) {
-      const errText = (r.stderr || r.stdout || "").trim();
-      return {
-        isError: true,
-        content: [{ type: "text", text: `Command failed (exit ${r.exitCode})${errText ? `: ${errText}` : ""}` }],
-      };
+      return cliFailure("command_failed", `Command failed with exit code ${r.exitCode}.`, {
+        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+      });
     }
 
     // Truncate very large stdout. Help tool already short-circuited above and
     // is exempt; every other tool gets the same budget.
-    let text = r.stdout || "";
+    if (stdoutBytes > serviceMaxBytes) {
+      return cliFailure("output_limit", `Command output is ${stdoutBytes} bytes; limit is ${serviceMaxBytes}.`, {
+        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+        maxOutputBytes: serviceMaxBytes, recoverable: true, ...outputStats(text),
+      });
+    }
     // Multica CLI may wrap MCP results in a JSON envelope. Preserve its blocks
     // and structured content before the generic plain-text output cap runs.
-    const envelope = parseMcpEnvelope(text);
-    if (envelope) return envelope;
-    if (text.length > serviceMaxBytes) {
-      const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown. Re-run with a narrower scope — e.g. pass a specific subcommand to the help tool, or target a single item — to get a smaller result.]`;
-      text = text.slice(0, serviceMaxBytes) + hint;
+    try {
+      const envelope = parseMcpEnvelope(text);
+      if (envelope) return envelope;
+    } catch {
+      return cliFailure("invalid_mcp_envelope", "Command returned a malformed MCP result envelope.", {
+        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+      });
+    }
+    if (jsonOutputRequested(argv)) {
+      try { JSON.parse(text); } catch {
+        return cliFailure("invalid_json", "Command was asked for JSON but returned malformed JSON.", {
+          stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+        });
+      }
     }
     return { content: [{ type: "text", text }] };
   });
