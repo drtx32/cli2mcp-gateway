@@ -29,6 +29,7 @@ import {
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execa } from "execa";
+import { parseMcpEnvelope } from "./mcp-envelope.mjs";
 import { discoverTools, buildArgv, captureHelp, parseSubcommandNames } from "./help-parser.js";
 import { loadBoxConfig, legacyEnvConfig, configSummary } from "./box-config.mjs";
 import { aggregateTools, buildDispatchTable, pickUpstreamToolMeta, resolveToolCall } from "./tool-aggregator.mjs";
@@ -898,6 +899,10 @@ function createServer() {
     // Truncate very large stdout. Help tool already short-circuited above and
     // is exempt; every other tool gets the same budget.
     let text = r.stdout || "";
+    // Multica CLI may wrap MCP results in a JSON envelope. Preserve its blocks
+    // and structured content before the generic plain-text output cap runs.
+    const envelope = parseMcpEnvelope(text);
+    if (envelope) return envelope;
     if (text.length > serviceMaxBytes) {
       const hint = `\n\n[TRUNCATED: output was ${text.length} bytes, only first ${serviceMaxBytes} shown. Re-run with a narrower scope — e.g. pass a specific subcommand to the help tool, or target a single item — to get a smaller result.]`;
       text = text.slice(0, serviceMaxBytes) + hint;
