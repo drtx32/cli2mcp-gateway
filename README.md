@@ -454,6 +454,20 @@ parsehub download https://www.xiaohongshu.com/discovery/item/6a5ccd97... -o /tmp
 
 The CLI's stdout (file list, JSON, etc.) is returned verbatim as the MCP tool result.
 
+### Tool call log entries
+
+Each MCP tool call writes one JSON line at `info` level. It records only the
+command/subcommand path, the serialized result size in bytes, and whether the
+call succeeded; argument values, stdin, and result content are never logged.
+For example:
+
+```json
+{"level":"info","info":"skill get","result_bytes":1234,"success":true}
+```
+
+`success` is false when the tool returns an MCP error or the handler throws.
+For a thrown error, `result_bytes` is 0 because no MCP tool result was returned.
+
 ---
 
 ## Why a custom gateway?
