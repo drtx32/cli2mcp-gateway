@@ -36,15 +36,21 @@ test("preserves non-text blocks and error state", () => {
   assert.deepEqual(parseMcpEnvelope(JSON.stringify({ isMcpEnvelope: true, result })), result);
 });
 
-test("ordinary output, malformed JSON, and invalid envelope shape fall back to text", () => {
+test("ordinary output and non-envelope text remain untouched; malformed envelopes fail", () => {
   assert.equal(parseMcpEnvelope("ordinary CLI output"), null);
+  assert.equal(parseMcpEnvelope(`diagnostic\n${JSON.stringify({ isMcpEnvelope: true, result: { content: [] } })}\n`), null);
   assert.throws(() => parseMcpEnvelope('{"isMcpEnvelope":true,"result":'), { code: "invalid_mcp_envelope" });
   assert.throws(() => parseMcpEnvelope(JSON.stringify({ isMcpEnvelope: true, result: { content: "bad" } })), { code: "invalid_mcp_envelope" });
   assert.equal(parseMcpEnvelope(JSON.stringify({ isMcpEnvelope: false, result: { content: [] } })), null);
 });
 
-test("only interprets the final non-empty stdout line as an envelope", () => {
+test("requires the whole trimmed stdout to be an envelope and accepts discriminator in any key order", () => {
   const envelope = JSON.stringify({ isMcpEnvelope: true, result: { content: [{ type: "text", text: "ok" }] } });
-  assert.equal(parseMcpEnvelope(`diagnostic\n${envelope}\n`).content[0].text, "ok");
-  assert.equal(parseMcpEnvelope(`diagnostic\n${envelope}\nmore diagnostic`), null);
+  const diagnostic = `diagnostic before\n${envelope}\ndiagnostic after`;
+  assert.equal(parseMcpEnvelope(`\n  ${envelope}  \n`).content[0].text, "ok");
+  assert.equal(parseMcpEnvelope(diagnostic), null);
+  const reordered = JSON.stringify({ version: 1, result: { content: [{ type: "text", text: "ordered" }] }, isMcpEnvelope: true });
+  assert.equal(parseMcpEnvelope(reordered).content[0].text, "ordered");
+  assert.equal(parseMcpEnvelope("  \n  "), null);
+  assert.throws(() => parseMcpEnvelope('{"isMcpEnvelope":true,"result":'), { code: "invalid_mcp_envelope" });
 });

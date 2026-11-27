@@ -351,47 +351,6 @@ function jsonOutputRequested(args) {
     arg === "--output=json" || (arg === "--output" && args[i + 1] === "json"));
 }
 
-function cliOutputChunk(buffer, text, offset, requestedLimit, maxOutputBytes, diagnostics) {
-  if (!Number.isSafeInteger(offset) || offset < 0 || offset > buffer.length) {
-    return cliFailure("invalid_output_offset", "output_offset must be a valid byte offset in the command output.", {
-      stdoutBytes: buffer.length, maxOutputBytes, recoverable: false,
-    });
-  }
-  const limit = Math.min(
-    Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? requestedLimit : maxOutputBytes,
-    maxOutputBytes,
-  );
-  if (offset < buffer.length && (buffer[offset] & 0xc0) === 0x80) {
-    return cliFailure("invalid_output_offset", "output_offset must start at a UTF-8 character boundary.", {
-      stdoutBytes: buffer.length, maxOutputBytes, recoverable: true,
-    });
-  }
-  let end = Math.min(offset + limit, buffer.length);
-  while (end < buffer.length && (buffer[end] & 0xc0) === 0x80) end--;
-  if (end === offset && offset < buffer.length) {
-    return cliFailure("output_limit_too_small", "output_limit is too small to fit one UTF-8 character.", {
-      stdoutBytes: buffer.length, maxOutputBytes, recoverable: false,
-    });
-  }
-  const chunk = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(offset, end));
-  return {
-    content: [{ type: "text", text: chunk }],
-    structuredContent: {
-      outputChunk: true,
-      byteOffset: offset,
-      byteLength: end - offset,
-      totalBytes: buffer.length,
-      nextOffset: end,
-      complete: end === buffer.length,
-      stdoutSha256: createHash("sha256").update(buffer).digest("hex"),
-      stdoutBytes: buffer.length,
-      ...diagnostics,
-      ...outputStats(text),
-    },
-    isError: false,
-  };
-}
-
 const boxConfigDir = box.path ? dirname(resolve(box.path)) : process.cwd();
 
 /**
@@ -826,19 +785,9 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
         stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
       });
     }
-    if (stdoutBytes > serviceMaxBytes) {
-      if (callArgs.output_offset !== undefined) {
-        return cliOutputChunk(stdoutBuffer, text, callArgs.output_offset, callArgs.output_limit, serviceMaxBytes, {
-          stderrBytes, exitCode: r.exitCode, elapsedMs,
-        });
-      }
-      return cliFailure("output_limit", `Command output is ${stdoutBytes} bytes; limit is ${serviceMaxBytes}. Retry with a narrower request.`, {
-        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-        maxOutputBytes: serviceMaxBytes, recoverable: true,
-        nextParameters: { output_offset: 0, output_limit: serviceMaxBytes },
-        ...outputStats(text),
-      });
-    }
+    // Preserve the historical _run contract: the CLI executes once and its
+    // complete stdout is returned. max_output_bytes continues to govern help
+    // and concrete tools, but must not cap or replay arbitrary _run commands.
     try {
       const envelope = parseMcpEnvelope(text);
       if (envelope) return envelope;

@@ -38,7 +38,8 @@ if (sample === "nonzero") {
   process.exit(7);
 }
 const targetBytes = ({ "sample-7311": 7311, "sample-26778": 26778,
-  "sample-30496": 30496, "sample-69642": 69642, "files-59611": 59611 })[sample];
+  "sample-30496": 30496, "sample-69642": 69642, "sample-131072": 131072,
+  "sample-2097152": 2097152, "files-59611": 59611 })[sample];
 const body = sample === "marker" ? 'fixture contains "isMcpEnvelope" and true as body text'
   : "技能正文🌱".repeat(sample === "sample-7311" ? 12 : sample === "sample-26778" ? 64
     : sample === "sample-30496" ? 128 : sample === "sample-69642" ? 256 : 4);
@@ -53,12 +54,13 @@ if (argv[1] === "files" && argv[2] === "list") {
   value = { id: sample, revision: 46, name: "fixture-skill", config: { enabled: true },
     ...(argv.includes("--with-content") ? { content: body } : {}), files };
 }
-if (sample === "envelope" || sample === "empty-envelope") {
+if (sample === "envelope" || sample === "empty-envelope" || sample === "reordered-envelope") {
   value = { isMcpEnvelope: true, result: {
-    content: sample === "envelope" ? [{ type: "text", text: "envelope-ok" }] : [],
-    ...(sample === "envelope" ? { structuredContent: { fileCount: files.length, label: "fixture" } } : {}),
+    content: sample === "empty-envelope" ? [] : [{ type: "text", text: sample === "reordered-envelope" ? "reordered-ok" : "envelope-ok" }],
+    ...(sample === "empty-envelope" ? {} : { structuredContent: { fileCount: files.length, label: "fixture" } }),
     isError: false,
   } };
+  if (sample === "reordered-envelope") value = { version: 1, result: value.result, isMcpEnvelope: true };
 }
 if (sample === "badjson") {
   process.stdout.write('{"content":');
@@ -76,7 +78,9 @@ if (targetBytes) {
   const baseBytes = Buffer.byteLength(JSON.stringify(value));
   padTarget.padding = "x".repeat(targetBytes - baseBytes);
 }
-const stdout = JSON.stringify(value);
+const stdout = sample === "diagnostic-envelope"
+  ? "diagnostic before\n" + JSON.stringify({ isMcpEnvelope: true, result: { content: [{ type: "text", text: "must remain text" }] } }) + "\ndiagnostic after"
+  : JSON.stringify(value);
 const stderr = "fixture stderr diagnostic\n";
 process.stderr.write(stderr);
 process.stdout.write(stdout);
@@ -88,7 +92,7 @@ appendFileSync(process.env.AUDIT_LOG, JSON.stringify({
 `;
 const TEST_TOKEN = "eli571-fixture-token";
 
-test("multica_run dispatch preserves CLI JSON and MCP envelopes on the SDK wire, with recoverable UTF-8 chunks", async () => {
+test("multica_run dispatch preserves complete stdout and unwraps only whole MCP envelopes", async () => {
   const dir = mkdtempSync(resolve(tmpdir(), "cli2mcp-multica-run-"));
   const port = await freePort();
   const command = resolve(dir, "multica");
@@ -115,40 +119,14 @@ test("multica_run dispatch preserves CLI JSON and MCP envelopes on the SDK wire,
       const toolNames = (await listTools()).tools.map((tool) => tool.name);
       assert.deepEqual(toolNames, ["multica_help", "multica_run", "multica_workspace"]);
       const runSchema = (await listTools()).tools.find((tool) => tool.name === "multica_run").inputSchema;
-      assert.ok(runSchema.properties.output_offset);
-      assert.ok(runSchema.properties.output_limit);
+      assert.equal("output_offset" in runSchema.properties, false);
+      assert.equal("output_limit" in runSchema.properties, false);
 
       const call = async (commandPath, args, extra = {}) => {
         const started = process.hrtime.bigint();
         const response = await callTool("multica_run", { commandPath, args, ...extra });
         response.roundTripMs = Number(process.hrtime.bigint() - started) / 1e6;
         return response;
-      };
-
-      const collectOutput = async (commandPath, args, first) => {
-        assert.equal(first.result.isError, true);
-        assert.equal(first.result.structuredContent.error, "output_limit");
-        const pieces = [];
-        let offset = 0;
-        let finalChunk;
-        do {
-          finalChunk = await call(commandPath, args, { output_offset: offset, output_limit: 16000 });
-          assert.equal(Boolean(finalChunk.result.isError), false);
-          const chunk = finalChunk.result.structuredContent;
-          assert.equal(chunk.byteOffset, offset);
-          assert.ok(chunk.byteLength > 0);
-          assert.equal(chunk.exitCode, 0);
-          assert.ok(chunk.stderrBytes > 0);
-          assert.ok(chunk.elapsedMs > 0);
-          pieces.push(finalChunk.result.content[0].text);
-          offset = chunk.nextOffset;
-          assert.ok(finalChunk.roundTripMs > 0);
-        } while (!finalChunk.result.structuredContent.complete);
-        const output = pieces.join("");
-        assert.equal(Buffer.byteLength(output), finalChunk.result.structuredContent.totalBytes);
-        assert.equal(createHash("sha256").update(output).digest("hex"),
-          finalChunk.result.structuredContent.stdoutSha256);
-        return output;
       };
 
       const metadata = await call(["skill", "get"], ["metadata", "--output", "json"]);
@@ -158,51 +136,29 @@ test("multica_run dispatch preserves CLI JSON and MCP envelopes on the SDK wire,
       assert.equal(metadataJson.id, "metadata");
       assert.equal("content" in metadataJson, false);
 
-      for (const targetBytes of [7311, 26778, 30496, 69642]) {
+      for (const targetBytes of [7311, 26778, 30496, 69642, 131072, 2097152]) {
         const sample = `sample-${targetBytes}`;
         const response = await call(["skill", "get"], [sample, "--with-content", "--output", "json"]);
-        if (targetBytes <= 16000) {
-          assert.equal(Boolean(response.result.isError), false, sample);
-          assert.equal(response.result.structuredContent, undefined, sample);
-          const json = JSON.parse(response.result.content[0].text);
-          assert.equal(Buffer.byteLength(response.result.content[0].text), targetBytes, sample);
-          assert.equal(json.content, "技能正文🌱".repeat(12));
-          assert.equal(json.files.length, 18);
-        } else {
-          assert.equal(response.result.isError, true, sample);
-          assert.equal(response.result.structuredContent.error, "output_limit", sample);
-          assert.equal(response.result.structuredContent.stdoutBytes, targetBytes, sample);
-          assert.equal(response.result.structuredContent.exitCode, 0, sample);
-          assert.ok(response.result.structuredContent.stderrBytes > 0, sample);
-          assert.ok(response.result.structuredContent.elapsedMs > 0, sample);
-          assert.equal(response.result.structuredContent.maxOutputBytes, 16000, sample);
-          assert.equal(response.result.structuredContent.fileCount, 18, sample);
-          assert.equal(response.result.structuredContent.bodySha256.length, 19, sample);
-          assert.equal(response.result.structuredContent.recoverable, true, sample);
-          assert.deepEqual(response.result.structuredContent.nextParameters,
-            { output_offset: 0, output_limit: 16000 });
-          const recovered = JSON.parse(await collectOutput(
-            ["skill", "get"], [sample, "--with-content", "--output", "json"], response,
-          ));
-          assert.equal(recovered.files.length, 18, sample);
-          assert.equal(createHash("sha256").update(recovered.content).digest("hex"),
-            response.result.structuredContent.bodySha256[0], sample);
-        }
+        assert.equal(Boolean(response.result.isError), false, sample);
+        assert.equal(response.result.structuredContent, undefined, sample);
+        const json = JSON.parse(response.result.content[0].text);
+        assert.equal(Buffer.byteLength(response.result.content[0].text), targetBytes, sample);
+        assert.equal(json.files.length, 18, sample);
+        const repeatCount = targetBytes === 7311 ? 12 : targetBytes === 26778 ? 64
+          : targetBytes === 30496 ? 128 : targetBytes === 69642 ? 256 : 4;
+        assert.equal(createHash("sha256").update(json.content).digest("hex"),
+          createHash("sha256").update("技能正文🌱".repeat(repeatCount)).digest("hex"), sample);
         assert.ok(response.roundTripMs > 0);
       }
+      const oversizedAuditCount = readFileSync(auditPath, "utf8").trim().split("\n")
+        .map((line) => JSON.parse(line)).filter((row) => row.sample === "sample-2097152").length;
+      assert.equal(oversizedAuditCount, 1, "oversized _run output must not cause command replay");
 
       const fileList = await call(["skill", "files", "list"], ["files-59611", "--with-content", "--output", "json"]);
-      assert.equal(fileList.result.isError, true);
-      assert.equal(fileList.result.structuredContent.error, "output_limit");
-      assert.equal(fileList.result.structuredContent.stdoutBytes, 59611);
-      assert.equal(fileList.result.structuredContent.exitCode, 0);
-      assert.ok(fileList.result.structuredContent.stderrBytes > 0);
-      assert.equal(fileList.result.structuredContent.fileCount, 18);
-      assert.equal(fileList.result.structuredContent.bodySha256.length, 18);
-      const recoveredFiles = JSON.parse(await collectOutput(
-        ["skill", "files", "list"], ["files-59611", "--with-content", "--output", "json"], fileList,
-      ));
+      assert.equal(Boolean(fileList.result.isError), false);
+      const recoveredFiles = JSON.parse(fileList.result.content[0].text);
       assert.equal(recoveredFiles.length, 18);
+      assert.equal(Buffer.byteLength(fileList.result.content[0].text), 59611);
 
       const marker = await call(["skill", "get"], ["marker", "--with-content", "--output", "json"]);
       assert.equal(Boolean(marker.result.isError), false);
@@ -213,6 +169,14 @@ test("multica_run dispatch preserves CLI JSON and MCP envelopes on the SDK wire,
       assert.deepEqual(envelope.result.content, [{ type: "text", text: "envelope-ok" }]);
       assert.deepEqual(envelope.result.structuredContent, { fileCount: 18, label: "fixture" });
       assert.equal(envelope.result.isError, false);
+
+      const reorderedEnvelope = await call(["skill", "get"], ["reordered-envelope", "--output", "json"]);
+      assert.deepEqual(reorderedEnvelope.result.content, [{ type: "text", text: "reordered-ok" }]);
+
+      const diagnosticEnvelope = await call(["skill", "get"], ["diagnostic-envelope"]);
+      assert.equal(Boolean(diagnosticEnvelope.result.isError), false);
+      assert.equal(diagnosticEnvelope.result.content[0].text,
+        `diagnostic before\n${JSON.stringify({ isMcpEnvelope: true, result: { content: [{ type: "text", text: "must remain text" }] } })}\ndiagnostic after`);
 
       const emptyEnvelope = await call(["skill", "get"], ["empty-envelope", "--output", "json"]);
       assert.equal(emptyEnvelope.result.isError, true);

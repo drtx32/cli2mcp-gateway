@@ -463,14 +463,6 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
             description: "Args forwarded verbatim after the command path, e.g. ['--title', 'X', '--output', 'json'].",
           },
           stdin: { type: "string", description: "Optional: piped into the CLI's stdin." },
-          output_offset: {
-            type: "integer", minimum: 0,
-            description: "Resume a large CLI stdout response at this UTF-8 byte offset.",
-          },
-          output_limit: {
-            type: "integer", minimum: 1,
-            description: "Maximum bytes to return for this stdout chunk (capped by the service output limit).",
-          },
         },
         additionalProperties: false,
       },
