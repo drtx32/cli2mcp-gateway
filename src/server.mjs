@@ -36,7 +36,7 @@ import { aggregateTools, buildDispatchTable, pickUpstreamToolMeta, resolveToolCa
 import { discoverStdioMcp, isStdioMcp } from "./adapters/mcp-stdio.mjs";
 import { discoverHttpMcp } from "./adapters/mcp-http.mjs";
 import { buildServiceEnv } from "./service-env.mjs";
-import { withToolCallInfoLog } from "./tool-call-info-log.mjs";
+import { toolCallInfo, withToolCallInfoLog } from "./tool-call-info-log.mjs";
 import {
   resolveWorkspaceConfig,
   resolveToolMode,
@@ -841,28 +841,9 @@ function createServer() {
         // dispatch (CLI command, cwd, timeout, env) comes from box config.
         const dispatch = toolDispatch.get(name);
         if (!dispatch) throw new Error(`Tool dispatch missing: ${name}`);
-        let commandParts;
-        if (dispatch.kind === "workspace" && typeof callArgs.subcommand === "string") {
-          commandParts = ["workspace", callArgs.subcommand];
-        } else if (["help", "run"].includes(dispatch.kind)
-            && Array.isArray(callArgs.commandPath) && callArgs.commandPath.length > 0) {
-          commandParts = callArgs.commandPath;
-        } else if (["help", "run"].includes(dispatch.kind)
-            && typeof callArgs.sub === "string" && callArgs.sub.length > 0) {
-          commandParts = [callArgs.sub];
-        } else if (Array.isArray(dispatch.commandPath) && dispatch.commandPath.length > 0) {
-          commandParts = dispatch.commandPath;
-        } else {
-          commandParts = [dispatch.originalName || tool.originalName || name];
-        }
         // Log only the command/subcommand path. Never include callArgs.args,
         // positional values, stdin, or any other user-supplied parameter values.
-        info = commandParts
-          .filter((part) => typeof part === "string")
-          .slice(0, 8)
-          .map((part) => part.replace(/[\u0000-\u001f\u007f]/g, ""))
-          .join(" ")
-          .slice(0, 256) || String(name).slice(0, 256);
+        info = toolCallInfo(name, tool, callArgs);
         const svc = box.config.services[dispatch.serviceName];
         if (!svc) throw new Error(`Service not found for tool ${name}: ${dispatch.serviceName}`);
         const serviceCwd = svc.cwd || env.CLI_CWD;

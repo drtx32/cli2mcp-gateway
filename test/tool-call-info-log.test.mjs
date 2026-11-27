@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { withToolCallInfoLog } from "../src/tool-call-info-log.mjs";
+import { toolCallInfo, withToolCallInfoLog } from "../src/tool-call-info-log.mjs";
 
 async function captureCall(info, handler) {
   const lines = [];
@@ -52,4 +52,34 @@ test("logs thrown handler errors as unsuccessful with zero result bytes, then re
     result_bytes: 0,
     success: false,
   });
+});
+
+test("skill_run records the requested dynamic command path, not its tool ID or arguments", async () => {
+  const name = "skill_run";
+  const tool = { name, dispatch: { kind: "run" } };
+  const callArgs = {
+    commandPath: ["skill", "get"],
+    args: { id: "private-argument" },
+  };
+  const info = toolCallInfo(name, tool, callArgs);
+  const { record, line } = await captureCall(info, async () => ({ content: [] }));
+
+  assert.equal(info, "skill get");
+  assert.equal(record.info, "skill get");
+  assert.equal(line.includes("skill_run"), false);
+  assert.equal(line.includes("private-argument"), false);
+});
+
+test("dynamic workspace subcommands and run paths are recorded accurately", () => {
+  const run = { dispatch: { kind: "run" } };
+  assert.equal(toolCallInfo("skill_run", run, {
+    commandPath: ["workspace", "list"],
+    args: { path: "/private/path" },
+  }), "workspace list");
+
+  const workspaceTool = { dispatch: { kind: "workspace", toolName: "skill_workspace" } };
+  assert.equal(toolCallInfo("skill_workspace", workspaceTool, {
+    subcommand: "read",
+    path: "private.txt",
+  }), "workspace read");
 });
