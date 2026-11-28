@@ -16,6 +16,23 @@ test("auto preserves legacy plain text and complete native envelope behavior", (
   assert.deepEqual(envelope.structuredContent, { ok: true });
 });
 
+test("opt-in auto JSON adapts complete JSON values while leaving mixed text alone", () => {
+  for (const value of [{ content: "business", nested: ["🌱"] }, [1, null], "scalar", 3, true, null]) {
+    const text = JSON.stringify(value);
+    const result = adaptCliResponse({ text, autoJson: true, fail });
+    assert.deepEqual(result.content, [{ type: "text", text }]);
+    assert.deepEqual(result.structuredContent, { data: value });
+  }
+  const mixed = "diagnostic\n{\"ok\":true}";
+  assert.deepEqual(adaptCliResponse({ text: mixed, autoJson: true, fail }), {
+    content: [{ type: "text", text: mixed }],
+  });
+  assert.equal(adaptCliResponse({ text: "bad", autoJson: true, legacyJsonOutput: true, fail }).code, "invalid_json");
+  const envelopeText = JSON.stringify({ isMcpEnvelope: true, result: { content: [{ type: "image", mimeType: "image/png", data: "AA==" }] } });
+  assert.deepEqual(adaptCliResponse({ text: envelopeText, autoJson: true, fail }).content,
+    [{ type: "image", mimeType: "image/png", data: "AA==" }]);
+});
+
 test("text explicitly keeps ordinary JSON as text while native envelopes still win", () => {
   const text = '{"content":"business"}';
   assert.deepEqual(adaptCliResponse({ text, responseMode: "text", fail }), {

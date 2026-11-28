@@ -39,7 +39,7 @@ if (sample === "nonzero") {
 }
 const targetBytes = ({ "sample-7311": 7311, "sample-26778": 26778,
   "sample-30496": 30496, "sample-69642": 69642, "sample-131072": 131072,
-  "sample-2097152": 2097152, "files-59611": 59611 })[sample];
+  "sample-2097152": 2097152, "ashare-array": 713906, "files-59611": 59611 })[sample];
 const body = sample === "marker" ? 'fixture contains "isMcpEnvelope" and true as body text'
   : "技能正文🌱".repeat(sample === "sample-7311" ? 12 : sample === "sample-26778" ? 64
     : sample === "sample-30496" ? 128 : sample === "sample-69642" ? 256 : 4);
@@ -54,6 +54,7 @@ if (argv[1] === "files" && argv[2] === "list") {
   value = { id: sample, revision: 46, name: "fixture-skill", config: { enabled: true },
     ...(argv.includes("--with-content") ? { content: body } : {}), files };
 }
+if (sample === "ashare-array") value = Array.from({ length: 1500 }, (_, i) => ({ code: "600" + String(i).padStart(3, "0"), price: 10 + i / 100, change_pct: i / 10, name: "样本" + i }));
 if (sample === "envelope" || sample === "empty-envelope" || sample === "reordered-envelope") {
   value = { isMcpEnvelope: true, result: {
     content: sample === "empty-envelope" ? [] : [{ type: "text", text: sample === "reordered-envelope" ? "reordered-ok" : "envelope-ok" }],
@@ -71,6 +72,10 @@ if (sample === "image-envelope") value = {
     { type: "text", text: "image fixture" },
     { type: "image", mimeType: "image/png", data: "AAECAw==" },
   ] },
+};
+if (sample === "audio-envelope") value = {
+  isMcpEnvelope: true,
+  result: { content: [{ type: "audio", mimeType: "audio/wav", data: "UklGRg==" }] },
 };
 if (sample === "badjson") {
   process.stdout.write('{"content":');
@@ -113,7 +118,7 @@ test("triple-mode multica_run exposes responseMode and adapts CLI results over M
   const yaml = [
     "name: multica-run-e2e",
     "services:", "  multica:", "    adapter: cli", `    command: ${JSON.stringify(command)}`,
-    "    tool_mode: triple", "    timeout_ms: 1000", "    max_output_bytes: 16000",
+    "    tool_mode: triple", "    auto_json: true", "    timeout_ms: 1000", "    max_output_bytes: 16000",
     "    env:", `      AUDIT_LOG: ${JSON.stringify(auditPath)}`,
     "    workspace:", `      path: ${JSON.stringify(workspace)}`,
     "transport:", "  type: http", "  host: 127.0.0.1", `  port: ${port}`, "  path: /mcp",
@@ -135,10 +140,17 @@ test("triple-mode multica_run exposes responseMode and adapts CLI results over M
       assert.deepEqual(runSchema.properties.responseMode.enum, ["auto", "text", "structured", "mcp"]);
       assert.match(runSchema.properties.responseMode.description, /not passed to the CLI/);
       assert.match(runTool.description, /Gateway-only responseMode/);
+      for (const advice of ["Prefer structured", "--output json", "--format json", "--with-content when JSON is expected", "Prefer text", "Use mcp", "Use auto", "Native envelopes take precedence", "Gateway-only, not CLI args"]) {
+        assert.ok(runSchema.properties.responseMode.description.includes(advice), `schema responseMode guidance missing ${advice}`);
+        assert.ok(runTool.description.includes(advice), `tools/list description missing ${advice}`);
+      }
       assert.equal(runTool.outputSchema, undefined);
 
       const help = await callTool("multica_help", {});
       assert.match(help.result.content[0].text, /responseMode is a Gateway-only parameter/);
+      for (const advice of ["Prefer structured", "--output json", "--format json", "--with-content when JSON is expected", "Prefer text", "Use mcp", "Use auto", "Native envelopes take precedence", "Gateway-only, not CLI args"]) {
+        assert.ok(help.result.content[0].text.includes(advice), `_help guidance missing ${advice}`);
+      }
       assert.match(help.result.content[0].text, /raw help below documents CLI arguments only/);
 
       const call = async (commandPath, args, extra = {}) => {
@@ -154,6 +166,7 @@ test("triple-mode multica_run exposes responseMode and adapts CLI results over M
       const metadataJson = JSON.parse(metadata.result.content[0].text);
       assert.equal(metadataJson.id, "metadata");
       assert.equal("content" in metadataJson, false);
+      assert.deepEqual(metadata.result.structuredContent, { data: metadataJson }, "legacy caller receives JSON adaptation without responseMode");
 
       const structuredObject = await call(["skill", "get"], ["metadata", "--output", "json"], { responseMode: "structured" });
       const structuredText = structuredObject.result.content[0].text;
@@ -174,8 +187,8 @@ test("triple-mode multica_run exposes responseMode and adapts CLI results over M
         const sample = `sample-${targetBytes}`;
         const response = await call(["skill", "get"], [sample, "--with-content", "--output", "json"]);
         assert.equal(Boolean(response.result.isError), false, sample);
-        assert.equal(response.result.structuredContent, undefined, sample);
         const json = JSON.parse(response.result.content[0].text);
+        assert.deepEqual(response.result.structuredContent, { data: json }, sample);
         assert.equal(Buffer.byteLength(response.result.content[0].text), targetBytes, sample);
         assert.equal(json.files.length, 18, sample);
         const repeatCount = targetBytes === 7311 ? 12 : targetBytes === 26778 ? 64
@@ -183,6 +196,11 @@ test("triple-mode multica_run exposes responseMode and adapts CLI results over M
         assert.equal(createHash("sha256").update(json.content).digest("hex"),
           createHash("sha256").update("技能正文🌱".repeat(repeatCount)).digest("hex"), sample);
         assert.ok(response.roundTripMs > 0);
+        if (targetBytes === 2097152) {
+          const textCopyBytes = Buffer.byteLength(response.result.content[0].text);
+          const structuredCopyBytes = Buffer.byteLength(JSON.stringify(response.result.structuredContent));
+          assert.ok(textCopyBytes + structuredCopyBytes > targetBytes * 1.8, "dual representation has material wire/serialization overhead");
+        }
       }
       const oversizedAuditCount = readFileSync(auditPath, "utf8").trim().split("\n")
         .map((line) => JSON.parse(line)).filter((row) => row.sample === "sample-2097152").length;
@@ -193,6 +211,12 @@ test("triple-mode multica_run exposes responseMode and adapts CLI results over M
       const recoveredFiles = JSON.parse(fileList.result.content[0].text);
       assert.equal(recoveredFiles.length, 18);
       assert.equal(Buffer.byteLength(fileList.result.content[0].text), 59611);
+
+      const ashareArray = await call(["stock", "list"], ["ashare-array", "--output", "json"]);
+      assert.equal(Buffer.byteLength(ashareArray.result.content[0].text), 713906);
+      assert.equal(ashareArray.result.structuredContent.data.length, 1500);
+      assert.ok(Buffer.byteLength(JSON.stringify(ashareArray.result.structuredContent)) > 713000,
+        "AShare-sized array is carried in a second structured representation");
 
       const marker = await call(["skill", "get"], ["marker", "--with-content", "--output", "json"]);
       assert.equal(Boolean(marker.result.isError), false);
@@ -210,6 +234,8 @@ test("triple-mode multica_run exposes responseMode and adapts CLI results over M
         { type: "text", text: "image fixture" },
         { type: "image", mimeType: "image/png", data: "AAECAw==" },
       ]);
+      const audioEnvelope = await call(["skill", "get"], ["audio-envelope"]);
+      assert.deepEqual(audioEnvelope.result.content, [{ type: "audio", mimeType: "audio/wav", data: "UklGRg==" }]);
       const mcpRequired = await call(["skill", "get"], ["metadata"], { responseMode: "mcp" });
       assert.equal(mcpRequired.result.structuredContent.error, "mcp_envelope_required");
       const malformedStructured = await call(["skill", "get"], ["badjson"], { responseMode: "structured" });

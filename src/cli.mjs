@@ -22,7 +22,9 @@ HTTP gateway instances through the runtime daemon.
 
 For a CLI service in tool_mode: dual / triple (or legacy CLI_DUAL_TOOL_MODE),
 the synthetic _run MCP tool accepts a Gateway-only responseMode argument:
-  auto (default, identical to legacy behavior), text, structured, or mcp.
+  Prefer structured for expected JSON (e.g. --output json / --format json / --with-content when JSON is expected), text for plain text, and mcp for known native envelopes.
+  auto uses per-service auto_json selection or legacy compatibility; with auto_json off, select structured when JSON fields are needed.
+  responseMode is Gateway-only, never a CLI argument; native envelopes take precedence. Do not automatically retry uncertain writes.
 It is not a CLI flag and is never forwarded to the wrapped command. See the
 _run tool description and input schema for exact result/error semantics.
 The wrapped CLI's own --help continues to describe its commandPath/args only.`);
