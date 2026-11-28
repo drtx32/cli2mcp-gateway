@@ -456,17 +456,78 @@ The CLI's stdout (file list, JSON, etc.) is returned verbatim as the MCP tool re
 
 ### Tool call log entries
 
-Each MCP tool call writes one JSON line at `info` level. It records only the
-command/subcommand path, the serialized result size in bytes, and whether the
-call succeeded; argument values, stdin, and result content are never logged.
-For example:
+Each MCP tool call writes one v2 JSON line at `info` level. It records a stable
+record ID, the command/subcommand path, result-shape metrics, and separate MCP
+tool-error / JSON-RPC handler-error flags. Argument values, stdin, exception
+messages, credentials, and result content are never logged. `result_bytes` is
+the UTF-8 byte length of the JSON-serialized tool result; `text_bytes` is the
+sum of UTF-8 byte lengths of text Content Blocks. Neither is the CLI stdout or
+the complete JSON-RPC response size.
 
 ```json
-{"level":"info","info":"skill get","result_bytes":1234,"success":true}
+{
+  "schema_version": 2,
+  "capabilities": [
+    "stable_record_id",
+    "outcome_state",
+    "result_shape_metrics",
+    "mcp_is_error",
+    "call_tool_handler_jsonrpc_error"
+  ],
+  "record_id": "<uuid>",
+  "level": "info",
+  "info": "skill get",
+  "outcome_state": "known",
+  "result_bytes": 1234,
+  "result_keys": ["content"],
+  "content_count": 1,
+  "content_types": ["text"],
+  "text_bytes": 1200,
+  "has_structured_content": false,
+  "success": true,
+  "is_error": false,
+  "jsonrpc_error": false
+}
 ```
 
-`success` is false when the tool returns an MCP error or the handler throws.
-For a thrown error, `result_bytes` is 0 because no MCP tool result was returned.
+`success` is false for an MCP result with `isError: true` or when the CallTool
+handler throws. `is_error` is null when there is no MCP tool result (for
+example, when the handler throws); `jsonrpc_error` is true for a thrown handler
+error, which the MCP Server turns into a JSON-RPC error response. This log is
+at the CallTool handler boundary; errors rejected before that handler runs and
+transport delivery failures are outside its observation scope.
+
+`outcome_state` is `known` when the handler returned a result or threw an error.
+It is `incomplete` if the outcome is known but result metrics could not be
+collected, and `unknown` is reserved for a future observer that cannot determine
+the outcome. A null field means not applicable or not observed as specified by
+the field; it must not be coerced to false.
+
+V1 records have no `schema_version` and contain the legacy `result_bytes` and
+`success` fields. Readers should treat missing `schema_version` as v1. Under
+this gateway's v1 writer contract, normalize a v1 record as follows:
+
+| V1 fields | Normalized v2 outcome |
+| --- | --- |
+| `success: true` | `known`, `is_error: false`, `jsonrpc_error: false` |
+| `success: false`, `result_bytes > 0` | `known`, `is_error: true`, `jsonrpc_error: false` |
+| `success: false`, `result_bytes: 0` | `known`, `is_error: null`, `jsonrpc_error: true` |
+| missing or invalid legacy fields | `incomplete`; preserve known values and use `null` where unknown |
+
+The legacy writer only sets a positive `result_bytes` after receiving and
+serializing a result; zero therefore identifies a thrown handler/serialization
+error. Do not rewrite archived source logs. A v2 reader should preserve unknown
+future versions as opaque records and avoid semantic parsing. There is no peer
+negotiation in this local log writer; any collector that only accepts v1 must be
+upgraded first or receive an explicit v1 compatibility projection, never a
+lossy silent downgrade.
+
+`record_id` is generated once per emitted request record and remains unchanged
+when that log event is redelivered or replayed. A collector can use it with the
+producer/instance ID as an idempotency key and compare `payload_hash` (computed
+by the collector) to detect ID collisions. The gateway itself has no quarantine
+queue, replay worker, or persistent idempotency ledger; those belong in a log
+collector that owns ingestion and replay state.
 
 ---
 
