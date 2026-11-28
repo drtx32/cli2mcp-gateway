@@ -29,7 +29,7 @@ import {
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execa } from "execa";
-import { parseMcpEnvelope } from "./mcp-envelope.mjs";
+import { adaptCliResponse } from "./response-adapter.mjs";
 import { discoverTools, buildArgv, captureHelp, parseSubcommandNames } from "./help-parser.js";
 import { loadBoxConfig, legacyEnvConfig, configSummary } from "./box-config.mjs";
 import { aggregateTools, buildDispatchTable, pickUpstreamToolMeta, resolveToolCall } from "./tool-aggregator.mjs";
@@ -154,7 +154,9 @@ Env:
   CLI_SUBCOMMANDS   optional comma-separated list of subcommands to expose
   CLI_TIMEOUT_MS    per-call CLI timeout (default 60s)
   CLI_MAX_OUTPUT_BYTES  per-call stdout byte cap before truncation (default 16 KB). The synthetic help tool is exempt.
-  CLI_DUAL_TOOL_MODE 1|true|yes — skip recursive subcommand tool expansion. Only expose `<cli>_help` and `<cli>_run` (the latter executes any subcommand via commandPath+args). Useful when top-level subcommands are command groupings (e.g. multica issue create) and per-tool schema inference yields empty schemas.
+  CLI_DUAL_TOOL_MODE 1|true|yes — skip recursive subcommand tool expansion. Only expose <cli>_help and <cli>_run (the latter executes any subcommand via commandPath+args). Useful when top-level subcommands are command groupings (e.g. multica issue create) and per-tool schema inference yields empty schemas.
+  _run responseMode (MCP argument; not a CLI flag): auto (default, legacy behavior), text, structured (valid JSON -> structuredContent {data: value}), or mcp (require a native MCP envelope). Complete native MCP envelopes take precedence in every mode.
+  _run runs the CLI once. It is not truncated by CLI_MAX_OUTPUT_BYTES; process errors and timeouts remain errors. Do not automatically retry an uncertain write. Native envelope content blocks (including images/audio) are preserved as-is; ordinary text is never guessed to be media. Request logs contain command path, serialized result byte count, and success only (not argument values).
   ALLOWED_HOSTS     Host header allowlist (anti-DNS-rebinding)
   MCP_ALLOWED_IPS   source-IP allowlist (comma-separated; bare IP, IP:port, CIDR)
   CORS_ORIGINS      comma-separated allowed origins
@@ -376,6 +378,15 @@ function syntheticHelpRunSpecs(serviceName, adapter = "cli") {
         ],
         description: "Named arguments or positional strings forwarded to the CLI.",
       };
+  const responseModeProperty = adapter === "cli"
+    ? {
+        responseMode: {
+          type: "string",
+          enum: ["auto", "text", "structured", "mcp"],
+          description: "Gateway-only response adapter (not passed to the CLI). Omit or use auto for legacy behavior; text returns ordinary stdout as text; structured requires valid JSON and returns structuredContent {data: parsedValue} while retaining the exact text block; mcp requires a complete native MCP envelope. A valid native envelope takes precedence in every mode and preserves typed blocks such as images. This command executes once: do not automatically retry an uncertain write. _run output is not truncated by max_output_bytes.",
+        },
+      }
+    : {};
   return [
     {
       name: `${serviceName}_help`,
@@ -404,7 +415,8 @@ function syntheticHelpRunSpecs(serviceName, adapter = "cli") {
         `Gateway meta-tool: invoke a tool on the wrapped MCP service "${serviceName}" ` +
         `by name. commandPath is forwarded as the underlying tool name; args become the ` +
         `tool arguments. Use this when you need to reach a tool that isn't exposed as ` +
-        `a top-level MCP tool (e.g. tool_mode=dual / triple mode).`,
+        `a top-level MCP tool (e.g. tool_mode=dual / triple mode). ` +
+        (adapter === "cli" ? "responseMode is a Gateway parameter, never a CLI flag; see its input property for auto/text/structured/mcp semantics and error behavior." : ""),
       inputSchema: {
         type: "object",
         properties: {
@@ -415,6 +427,7 @@ function syntheticHelpRunSpecs(serviceName, adapter = "cli") {
           },
           args: runArgsSchema,
           stdin: { type: "string", description: "Optional: piped into the tool's stdin." },
+          ...responseModeProperty,
         },
         additionalProperties: false,
       },
@@ -494,14 +507,6 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
         helpTimeoutMs: svc.timeout_ms,
       },
     );
-    const structuredTools = new Set(svc.structured_output_tools || []);
-    for (const tool of perServiceTools[serviceName]) {
-      if (structuredTools.has(tool.name)) {
-        // Open object schema preserves arbitrary business keys without
-        // rewriting the CLI's JSON value. This is opt-in per CLI tool.
-        tool.outputSchema = { type: "object", additionalProperties: true };
-      }
-    }
   } else if (svc.adapter === "mcp-stdio") {
     const { tools, client, close } = await discoverStdioMcp({
       name: serviceName,
@@ -695,7 +700,10 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
     const target = `${svc.command}${commandPathText} --help`;
     const header = [
       `Help for ${svc.command}${commandPathText}.`,
-      `Use this meta-tool to inspect the CLI, or pass "commandPath" (preferred) or "sub" plus "args" to drill down into a command help page.`,
+      `Use this meta-tool to inspect the CLI, or pass "commandPath" (preferred) or "sub" plus "args" to drill down into a command help page. The raw help below documents CLI arguments only.`,
+      `For CLI _run, responseMode is a Gateway-only parameter and is not passed to the CLI. auto preserves legacy behavior; use text, structured, or mcp as documented in the _run tool schema.`,
+      `structured requires valid JSON (including arrays/scalars/null) and returns {data: value} plus unchanged stdout text; mcp requires one complete native envelope. Native envelopes take precedence in every mode and preserve typed blocks.`,
+      `The CLI executes once. Do not automatically retry an uncertain write. _run returns complete stdout without the max_output_bytes cap; concrete leaf tools are capped and can return output_limit errors. Request logs include command path/result_bytes/success, not argument values.`,
       `Raw output from ${target}:`,
     ].join("\n");
     const workspaceSection = (commandPath.length === 0 && perServiceWorkspace[dispatch.serviceName])
@@ -794,25 +802,16 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
         stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
       });
     }
-    // Preserve the historical _run contract: the CLI executes once and its
-    // complete stdout is returned. max_output_bytes continues to govern help
-    // and concrete tools, but must not cap or replay arbitrary _run commands.
-    try {
-      const envelope = parseMcpEnvelope(text);
-      if (envelope) return envelope;
-    } catch {
-      return cliFailure("invalid_mcp_envelope", "Command returned a malformed MCP result envelope.", {
+    // One execution feeds a shared response adapter. _run output remains
+    // uncapped by max_output_bytes and is never replayed for continuation.
+    return adaptCliResponse({
+      text,
+      responseMode: callArgs.responseMode || "auto",
+      legacyJsonOutput: jsonOutputRequested(callArgs.args),
+      fail: (kind, message) => cliFailure(kind, message, {
         stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-      });
-    }
-    if (jsonOutputRequested(callArgs.args)) {
-      try { JSON.parse(text); } catch {
-        return cliFailure("invalid_json", "Command was asked for JSON but returned malformed JSON.", {
-          stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-        });
-      }
-    }
-    return { content: [{ type: "text", text }] };
+      }),
+    });
   }
 
   throw new Error(`dispatchSyntheticCall: unknown dispatch kind "${kind}"`);
@@ -1009,40 +1008,16 @@ function createServer() {
             maxOutputBytes: serviceMaxBytes, recoverable: true, ...outputStats(text),
           });
         }
-        // Multica CLI may wrap MCP results in a JSON envelope. Preserve its blocks
-        // and structured content before the generic plain-text output cap runs.
-        try {
-          const envelope = parseMcpEnvelope(text);
-          if (envelope) {
-            if (tool.outputSchema) {
-              return {
-                isError: true,
-                content: [{ type: "text", text }],
-              };
-            }
-            return envelope;
-          }
-        } catch {
-          return cliFailure("invalid_mcp_envelope", "Command returned a malformed MCP result envelope.", {
+        // Leaf tools share auto-mode adaptation with synthetic _run. Only _run
+        // exposes responseMode; leaf behavior remains byte-for-byte compatible.
+        return adaptCliResponse({
+          text,
+          responseMode: "auto",
+          legacyJsonOutput: jsonOutputRequested(argv),
+          fail: (kind, message) => cliFailure(kind, message, {
             stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-          });
-        }
-        if (jsonOutputRequested(argv)) {
-          try { JSON.parse(text); } catch {
-            return cliFailure("invalid_json", "Command was asked for JSON but returned malformed JSON.", {
-              stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-            });
-          }
-        }
-        if (tool.outputSchema) {
-          let parsed;
-          try { parsed = JSON.parse(text); } catch { parsed = undefined; }
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-            return { content: [{ type: "text", text }], isError: true };
-          }
-          return { content: [{ type: "text", text }], structuredContent: parsed };
-        }
-        return { content: [{ type: "text", text }] };
+          }),
+        });
     });
   });
   return server;

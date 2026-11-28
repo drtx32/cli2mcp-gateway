@@ -86,28 +86,6 @@ auth:
   assert.equal(config.auth.token, "abc");
 });
 
-test("loadBoxConfig: structured output opt-in defaults off and accepts tool names", () => {
-  const { config } = loadBoxConfigFromString(`
-name: demo
-services:
-  cli:
-    adapter: cli
-    command: example
-transport: {type: stdio}
-`);
-  assert.deepEqual(config.services.cli.structured_output_tools, []);
-  const optedIn = loadBoxConfigFromString(`
-name: demo
-services:
-  cli:
-    adapter: cli
-    command: example
-    structured_output_tools: [get_json]
-transport: {type: stdio}
-`);
-  assert.deepEqual(optedIn.config.services.cli.structured_output_tools, ["get_json"]);
-});
-
 test("loadBoxConfig: accepts auto and mcp-http service adapters", () => {
   const dir = fs.mkdtempSync(path.resolve(os.tmpdir(), "cli2mcp-adapters-"));
   const boxPath = path.resolve(dir, "box.yaml");
