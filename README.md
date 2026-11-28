@@ -313,6 +313,43 @@ The names in the table are per-service tool names. With the default multi-servic
 aggregation, the public name also includes the service name and `__` separator;
 the example below shows the resulting names.
 
+### `_run` response modes
+
+The generic CLI `_run` tool is available in `tool_mode: dual` / `triple` and
+legacy `CLI_DUAL_TOOL_MODE`. Its optional `responseMode` argument is handled by
+the Gateway and is never passed to the wrapped CLI. Omit it or use `auto` for
+the exact legacy behavior.
+
+| `responseMode` | Behavior |
+| --- | --- |
+| `auto` | Unwrap a complete native MCP envelope; otherwise return stdout as text. Existing `--output json` validation remains. |
+| `text` | Return ordinary stdout as text. A complete native MCP envelope still takes precedence. |
+| `structured` | Require valid JSON and return the original text block plus `structuredContent: { data: parsedValue }`. Supports objects, arrays, strings, numbers, booleans, and null. A native MCP envelope still takes precedence. |
+| `mcp` | Require one complete native MCP result envelope. Plain JSON/text becomes an `isError` tool result. |
+
+Native envelopes are recognized only when the complete trimmed stdout is a
+valid Gateway envelope. Their text/image/audio and other typed blocks,
+`structuredContent`, and `isError` are preserved; the Gateway never guesses
+that ordinary text, a URL, or a base64 string is an image. A malformed
+envelope marker remains an error. Process failures, timeouts, invalid UTF-8,
+and malformed JSON in structured mode remain tool errors.
+
+`_run` executes the CLI once. It returns complete stdout and is not truncated
+by `max_output_bytes`; it never replays a command to continue a response. Do
+not automatically retry an uncertain write after a timeout or other ambiguous
+failure. This differs from concrete leaf CLI tools, whose stdout is subject to
+`max_output_bytes` and whose errors identify output-limit failures. Request
+logs contain the command path, serialized result byte count, and success flag;
+they do not include argument values.
+
+The Gateway adds this behavior in the `_run` tool description/input schema,
+Gateway command help, and `_help` preamble. The raw help printed by the wrapped
+CLI describes its own commandPath/args, not `responseMode`. A wrapped CLI's
+own help belongs to that upstream project; this repository has no Typer CLI
+source to change. When a wrapped Typer CLI omits or misstates a command option,
+use `_help` to display its raw command help and fix that help in the upstream
+CLI repository rather than forwarding Gateway parameters as CLI flags.
+
 ### Managed workspace
 
 When `workspace.path` is configured and `tool_mode` is not `dual`, the

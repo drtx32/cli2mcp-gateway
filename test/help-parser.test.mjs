@@ -257,6 +257,9 @@ COMMANDS
   assert.equal(runTool.inputSchema.properties.args.type, "array");
   assert.equal(runTool.inputSchema.properties.args.items.type, "string");
   assert.equal(runTool.inputSchema.properties.stdin.type, "string");
+  assert.deepEqual(runTool.inputSchema.properties.responseMode.enum, ["auto", "text", "structured", "mcp"]);
+  assert.match(runTool.inputSchema.properties.responseMode.description, /not passed to the CLI/);
+  assert.match(runTool.description, /Gateway-only responseMode/);
 
   // Sanity: help tool still works in dualToolMode (drill-down signature)
   const helpTool = tools.find((tool) => tool.name === "multica_help");

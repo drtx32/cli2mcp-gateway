@@ -1,0 +1,23 @@
+# CLI _run responseMode example (Gateway-level MCP parameter, not CLI argv).
+# Start with: cli2mcp-gateway serve --config ./cli-response-modes-example.yaml --stdio
+name: cli-response-modes-example
+
+services:
+  multica:
+    adapter: cli
+    command: multica
+    tool_mode: triple
+    timeout_ms: 60000
+    max_output_bytes: 16000 # Applies to concrete leaf tools/help, not synthetic _run.
+    workspace:
+      path: ./workspace # Required for triple mode; workspace access is read-only.
+
+transport:
+  type: stdio
+
+# Call the synthetic `multica_run` MCP tool (available when agent tools are
+# built from this box) with e.g.:
+#   {"commandPath":["skill","get"], "args":["<skill-id>","--with-content"], "responseMode":"structured"}
+# `responseMode` values: auto (default/legacy), text, structured, mcp.
+# For AShare output already wrapped with `--format mcp`, use auto or mcp;
+# native envelopes always take precedence and retain typed content blocks.

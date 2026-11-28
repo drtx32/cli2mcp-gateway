@@ -448,7 +448,8 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
       description:
         "Gateway meta-tool: run the wrapped CLI with the given command path and args. " +
         "Use this when no per-subcommand tool is exposed (CLI_DUAL_TOOL_MODE=true) or when you need to invoke a nested subcommand. " +
-        "Prefer calling the `_help` tool first to inspect flags/arguments, then pass them via `args`.",
+        "Prefer calling the `_help` tool first to inspect flags/arguments, then pass them via `args`. " +
+        "Gateway-only responseMode (not sent to the CLI): auto (default, legacy behavior), text, structured (valid JSON -> structuredContent {data: value}, keeping the text block), or mcp (require a complete native MCP envelope). A valid native envelope takes precedence in every mode and preserves typed content blocks. The CLI runs once; do not automatically retry an uncertain write. _run output is not truncated by CLI_MAX_OUTPUT_BYTES.",
       inputSchema: {
         type: "object",
         properties: {
@@ -463,6 +464,11 @@ export async function discoverTools(baseCmd, subcommands = null, options = {}) {
             description: "Args forwarded verbatim after the command path, e.g. ['--title', 'X', '--output', 'json'].",
           },
           stdin: { type: "string", description: "Optional: piped into the CLI's stdin." },
+          responseMode: {
+            type: "string",
+            enum: ["auto", "text", "structured", "mcp"],
+            description: "Gateway-only (not passed to the CLI). Omit or auto for legacy behavior; text forces ordinary stdout text; structured requires valid JSON and returns structuredContent {data: parsedValue} plus the unchanged text block; mcp requires a complete native MCP envelope. Native envelopes take precedence in all modes and preserve image/audio blocks. The command executes once; do not retry an uncertain write automatically. _run is not truncated by CLI_MAX_OUTPUT_BYTES.",
+          },
         },
         additionalProperties: false,
       },

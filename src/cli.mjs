@@ -18,7 +18,14 @@ function usage() {
   cli2mcp-gateway logs <id> [--tail N] [--follow]
 
 serve is the foreground server mode. The other commands manage local
-HTTP gateway instances through the runtime daemon.`);
+HTTP gateway instances through the runtime daemon.
+
+For a CLI service in tool_mode: dual / triple (or legacy CLI_DUAL_TOOL_MODE),
+the synthetic _run MCP tool accepts a Gateway-only responseMode argument:
+  auto (default, identical to legacy behavior), text, structured, or mcp.
+It is not a CLI flag and is never forwarded to the wrapped command. See the
+_run tool description and input schema for exact result/error semantics.
+The wrapped CLI's own --help continues to describe its commandPath/args only.`);
 }
 
 function option(name, fallback = undefined) {
