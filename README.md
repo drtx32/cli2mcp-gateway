@@ -313,6 +313,33 @@ The names in the table are per-service tool names. With the default multi-servic
 aggregation, the public name also includes the service name and `__` separator;
 the example below shows the resulting names.
 
+### Optional structured JSON output for CLI tools
+
+For a CLI leaf tool whose successful stdout is always a top-level JSON object,
+set `structured_output_tools` to its discovered per-service tool name:
+
+```yaml
+services:
+  multica:
+    adapter: cli
+    command: multica
+    structured_output_tools: [multica_skill_get]
+```
+
+Names are the discovered per-service tool names (the CLI basename plus its
+subcommand path, for example `multica_skill_get`); gateway namespace prefixes
+are not included. The gateway advertises an open JSON object `outputSchema` for
+only those tools.
+On success it keeps the original stdout text block byte-for-byte at the text
+level and adds the parsed object as `structuredContent`, without changing any
+business fields. This is opt-in and applies only to the CLI adapter. JSON
+arrays, scalar or null JSON, non-JSON output, and native MCP result envelopes
+do not satisfy the declared object contract: the call is returned as an error
+with its original stdout text. Existing process, timeout, and size errors
+remain errors. Configure this only for tools with the stated object-output
+contract; omitted or empty `structured_output_tools` preserves existing
+behavior and publishes no output schema.
+
 ### Managed workspace
 
 When `workspace.path` is configured and `tool_mode` is not `dual`, the

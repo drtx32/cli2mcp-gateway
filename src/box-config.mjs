@@ -130,6 +130,10 @@ const ServiceBase = z.object({
   // Explicit tool_mode wins over the legacy `dual_tool_mode` flag when both
   // are set on the same service.
   tool_mode: z.enum(["normal", "dual", "triple"]).optional(),
+  // Opt in selected CLI leaf tools to a second structured output channel.
+  // Names are the CLI tool names before gateway namespacing. Each selected
+  // tool must return a top-level JSON object on successful calls.
+  structured_output_tools: z.array(z.string().min(1)).optional().default([]),
   // Single-root read-only managed workspace. When `path` is set, the gateway
   // exposes a synthetic `<cli>_workspace` tool with subcommands dir / list / stat /
   // read. The agent uses this to discover the canonical absolute workspace

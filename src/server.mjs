@@ -494,6 +494,14 @@ for (const [serviceName, configuredSvc] of Object.entries(box.config.services)) 
         helpTimeoutMs: svc.timeout_ms,
       },
     );
+    const structuredTools = new Set(svc.structured_output_tools || []);
+    for (const tool of perServiceTools[serviceName]) {
+      if (structuredTools.has(tool.name)) {
+        // Open object schema preserves arbitrary business keys without
+        // rewriting the CLI's JSON value. This is opt-in per CLI tool.
+        tool.outputSchema = { type: "object", additionalProperties: true };
+      }
+    }
   } else if (svc.adapter === "mcp-stdio") {
     const { tools, client, close } = await discoverStdioMcp({
       name: serviceName,
@@ -1005,7 +1013,15 @@ function createServer() {
         // and structured content before the generic plain-text output cap runs.
         try {
           const envelope = parseMcpEnvelope(text);
-          if (envelope) return envelope;
+          if (envelope) {
+            if (tool.outputSchema) {
+              return {
+                isError: true,
+                content: [{ type: "text", text }],
+              };
+            }
+            return envelope;
+          }
         } catch {
           return cliFailure("invalid_mcp_envelope", "Command returned a malformed MCP result envelope.", {
             stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
@@ -1017,6 +1033,14 @@ function createServer() {
               stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
             });
           }
+        }
+        if (tool.outputSchema) {
+          let parsed;
+          try { parsed = JSON.parse(text); } catch { parsed = undefined; }
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            return { content: [{ type: "text", text }], isError: true };
+          }
+          return { content: [{ type: "text", text }], structuredContent: parsed };
         }
         return { content: [{ type: "text", text }] };
     });
