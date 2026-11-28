@@ -118,6 +118,10 @@ const ServiceBase = z.object({
   env: z.record(z.string(), z.string()).optional(),
   timeout_ms: z.number().int().optional().default(60_000),
   max_output_bytes: z.number().int().optional().default(16_000),
+  // Opt-in auto adaptation for CLI `_run`: valid JSON stdout gets a parallel
+  // structuredContent `{data: value}` while preserving the exact text block.
+  // Disabled by default because this adds payload size and changes response shape.
+  auto_json: z.boolean().optional().default(false),
   // Explicit service-level tool exposure mode. Per ELI-398:
   //   normal — existing recursive per-subcommand discovery + synthetic help
   //            (auto-exposes synthetic workspace tool when workspace.path

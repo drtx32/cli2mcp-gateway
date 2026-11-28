@@ -1,7 +1,7 @@
 import { parseMcpEnvelope } from "./mcp-envelope.mjs";
 
 /** Adapt one already-executed CLI stdout value. Never replays the command. */
-export function adaptCliResponse({ text, responseMode = "auto", legacyJsonOutput = false, fail }) {
+export function adaptCliResponse({ text, responseMode = "auto", legacyJsonOutput = false, autoJson = false, fail }) {
   if (!["auto", "text", "structured", "mcp"].includes(responseMode)) {
     return fail("invalid_response_mode", "responseMode must be auto, text, structured, or mcp.");
   }
@@ -31,12 +31,20 @@ export function adaptCliResponse({ text, responseMode = "auto", legacyJsonOutput
       structuredContent: { data: parsed },
     };
   }
-  if (responseMode === "auto" && legacyJsonOutput) {
+  if (responseMode === "auto" && (legacyJsonOutput || autoJson)) {
+    let parsed;
     try {
-      JSON.parse(text);
+      parsed = JSON.parse(text);
     } catch {
-      return fail("invalid_json", "Command was asked for JSON but returned malformed JSON.");
+      if (legacyJsonOutput) {
+        return fail("invalid_json", "Command was asked for JSON but returned malformed JSON.");
+      }
+      // Opt-in auto detection is deliberately conservative: mixed/plain text
+      // remains text. A malformed payload is an error only when the CLI args
+      // explicitly requested JSON, preserving that existing contract.
+      return { content: [{ type: "text", text }] };
     }
+    if (autoJson) return { content: [{ type: "text", text }], structuredContent: { data: parsed } };
   }
   return { content: [{ type: "text", text }] };
 }

@@ -82,8 +82,25 @@ auth:
   const { config } = loadBoxConfigFromString(yaml);
   assert.equal(config.name, "demo");
   assert.equal(config.services.ashare.command, "ashare");
+  assert.equal(config.services.ashare.auto_json, false, "auto JSON stays off by default for response-shape compatibility");
   assert.equal(config.transport.port, 3100);
   assert.equal(config.auth.token, "abc");
+});
+
+test("loadBoxConfig: auto_json is a per-service opt-in", () => {
+  const { config } = loadBoxConfigFromString(`
+name: opt-in
+services:
+  multica:
+    adapter: cli
+    command: multica
+    auto_json: true
+transport:
+  type: stdio
+auth:
+  mode: none
+`);
+  assert.equal(config.services.multica.auto_json, true);
 });
 
 test("loadBoxConfig: accepts auto and mcp-http service adapters", () => {

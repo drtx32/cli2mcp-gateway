@@ -322,7 +322,7 @@ the exact legacy behavior.
 
 | `responseMode` | Behavior |
 | --- | --- |
-| `auto` | Unwrap a complete native MCP envelope; otherwise return stdout as text. Existing `--output json` validation remains. |
+| `auto` | Unwrap a complete native MCP envelope; otherwise return stdout as text by default. When the service opts into `auto_json: true`, complete valid JSON stdout also gets `structuredContent: { data: parsedValue }` while retaining the exact text block. |
 | `text` | Return ordinary stdout as text. A complete native MCP envelope still takes precedence. |
 | `structured` | Require valid JSON and return the original text block plus `structuredContent: { data: parsedValue }`. Supports objects, arrays, strings, numbers, booleans, and null. A native MCP envelope still takes precedence. |
 | `mcp` | Require one complete native MCP result envelope. Plain JSON/text becomes an `isError` tool result. |
@@ -333,6 +333,27 @@ valid Gateway envelope. Their text/image/audio and other typed blocks,
 that ordinary text, a URL, or a base64 string is an image. A malformed
 envelope marker remains an error. Process failures, timeouts, invalid UTF-8,
 and malformed JSON in structured mode remain tool errors.
+
+Automatic JSON adaptation is opt-in per CLI service in `box.yaml`:
+
+```yaml
+services:
+  multica:
+    adapter: cli
+    auto_json: true
+```
+
+This makes legacy `_run` callers benefit without adding `responseMode`: after
+the one CLI execution, a complete valid JSON value (object, array, scalar, or
+`null`) is parsed into `{data: value}`. Native MCP envelopes always take
+precedence; non-JSON or mixed text stays text. Explicit `text`, `structured`,
+and `mcp` requests keep their contracts. An invocation that explicitly asks
+the CLI for JSON still errors if stdout is malformed JSON. The default is
+`false`, preserving existing response shapes across deployments. Enable it
+only for services whose clients can accept the additional structured copy:
+large responses carry both the text and parsed structured representation,
+increasing serialization, memory, and transport cost. Disable `auto_json` to
+roll back immediately; no CLI flags or permissions change.
 
 `_run` executes the CLI once. It returns complete stdout and is not truncated
 by `max_output_bytes`; it never replays a command to continue a response. Do

@@ -155,6 +155,7 @@ Env:
   CLI_TIMEOUT_MS    per-call CLI timeout (default 60s)
   CLI_MAX_OUTPUT_BYTES  per-call stdout byte cap before truncation (default 16 KB). The synthetic help tool is exempt.
   CLI_DUAL_TOOL_MODE 1|true|yes — skip recursive subcommand tool expansion. Only expose <cli>_help and <cli>_run (the latter executes any subcommand via commandPath+args). Useful when top-level subcommands are command groupings (e.g. multica issue create) and per-tool schema inference yields empty schemas.
+  auto_json (box.yaml service option, default false) enables responseMode=auto to add structuredContent {data: parsedValue} for complete valid JSON stdout. Native MCP envelopes still win; malformed explicit JSON remains an error. Adds a second representation and response cost; leave disabled unless clients benefit.
   _run responseMode (MCP argument; not a CLI flag): auto (default, legacy behavior), text, structured (valid JSON -> structuredContent {data: value}), or mcp (require a native MCP envelope). Complete native MCP envelopes take precedence in every mode.
   _run runs the CLI once. It is not truncated by CLI_MAX_OUTPUT_BYTES; process errors and timeouts remain errors. Do not automatically retry an uncertain write. Native envelope content blocks (including images/audio) are preserved as-is; ordinary text is never guessed to be media. Request logs contain command path, serialized result byte count, and success only (not argument values).
   ALLOWED_HOSTS     Host header allowlist (anti-DNS-rebinding)
@@ -383,7 +384,7 @@ function syntheticHelpRunSpecs(serviceName, adapter = "cli") {
         responseMode: {
           type: "string",
           enum: ["auto", "text", "structured", "mcp"],
-          description: "Gateway-only response adapter (not passed to the CLI). Omit or use auto for legacy behavior; text returns ordinary stdout as text; structured requires valid JSON and returns structuredContent {data: parsedValue} while retaining the exact text block; mcp requires a complete native MCP envelope. A valid native envelope takes precedence in every mode and preserves typed blocks such as images. This command executes once: do not automatically retry an uncertain write. _run output is not truncated by max_output_bytes.",
+          description: "Gateway-only response adapter (not passed to the CLI). auto preserves legacy text behavior by default; a service configured with auto_json: true adds structuredContent {data: parsedValue} for complete valid JSON stdout. JSON output flags are also validated and adapted when auto_json is enabled. text forces ordinary stdout text; structured requires valid JSON and returns structuredContent {data: parsedValue} plus the exact text block; mcp requires a complete native MCP envelope. Native envelopes take precedence and preserve typed blocks. This command executes once; do not automatically retry an uncertain write. _run output is not truncated by max_output_bytes.",
         },
       }
     : {};
@@ -416,7 +417,7 @@ function syntheticHelpRunSpecs(serviceName, adapter = "cli") {
         `by name. commandPath is forwarded as the underlying tool name; args become the ` +
         `tool arguments. Use this when you need to reach a tool that isn't exposed as ` +
         `a top-level MCP tool (e.g. tool_mode=dual / triple mode). ` +
-        (adapter === "cli" ? "responseMode is a Gateway parameter, never a CLI flag; see its input property for auto/text/structured/mcp semantics and error behavior." : ""),
+        (adapter === "cli" ? "responseMode is a Gateway parameter, never a CLI flag; auto_json: true is an opt-in per-service setting for legacy callers. See its input property for auto/text/structured/mcp semantics and error behavior." : ""),
       inputSchema: {
         type: "object",
         properties: {
@@ -701,7 +702,7 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
     const header = [
       `Help for ${svc.command}${commandPathText}.`,
       `Use this meta-tool to inspect the CLI, or pass "commandPath" (preferred) or "sub" plus "args" to drill down into a command help page. The raw help below documents CLI arguments only.`,
-      `For CLI _run, responseMode is a Gateway-only parameter and is not passed to the CLI. auto preserves legacy behavior; use text, structured, or mcp as documented in the _run tool schema.`,
+      `For CLI _run, responseMode is a Gateway-only parameter and is not passed to the CLI. auto preserves legacy behavior unless this service opts into auto_json: true; use text, structured, or mcp as documented in the _run tool schema.`,
       `structured requires valid JSON (including arrays/scalars/null) and returns {data: value} plus unchanged stdout text; mcp requires one complete native envelope. Native envelopes take precedence in every mode and preserve typed blocks.`,
       `The CLI executes once. Do not automatically retry an uncertain write. _run returns complete stdout without the max_output_bytes cap; concrete leaf tools are capped and can return output_limit errors. Request logs include command path/result_bytes/success, not argument values.`,
       `Raw output from ${target}:`,
@@ -808,6 +809,7 @@ async function dispatchSyntheticCall(tool, dispatch, callArgs, ctxEnv) {
       text,
       responseMode: callArgs.responseMode || "auto",
       legacyJsonOutput: jsonOutputRequested(callArgs.args),
+      autoJson: svc.auto_json === true,
       fail: (kind, message) => cliFailure(kind, message, {
         stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
       }),
