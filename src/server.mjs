@@ -36,6 +36,7 @@ import { aggregateTools, buildDispatchTable, pickUpstreamToolMeta, resolveToolCa
 import { discoverStdioMcp, isStdioMcp } from "./adapters/mcp-stdio.mjs";
 import { discoverHttpMcp } from "./adapters/mcp-http.mjs";
 import { buildServiceEnv } from "./service-env.mjs";
+import { toolCallInfo, withToolCallInfoLog } from "./tool-call-info-log.mjs";
 import {
   resolveWorkspaceConfig,
   resolveToolMode,
@@ -830,189 +831,195 @@ function createServer() {
     })),
   }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: callArgs = {} } = request.params;
-    const tool = toolByName.get(name);
-    if (!tool) throw new Error(`Tool not allowlisted: ${name}`);
+    let info = String(request.params?.name || "unknown").slice(0, 256);
+    return withToolCallInfoLog(() => info, async () => {
+        const { name, arguments: callArgs = {} } = request.params;
+        const tool = toolByName.get(name);
+        if (!tool) throw new Error(`Tool not allowlisted: ${name}`);
 
-    // Look up the owning service from the dispatch table so per-call
-    // dispatch (CLI command, cwd, timeout, env) comes from box config.
-    const dispatch = toolDispatch.get(name);
-    if (!dispatch) throw new Error(`Tool dispatch missing: ${name}`);
-    const svc = box.config.services[dispatch.serviceName];
-    if (!svc) throw new Error(`Service not found for tool ${name}: ${dispatch.serviceName}`);
-    const serviceCwd = svc.cwd || env.CLI_CWD;
-    const serviceTimeout = svc.timeout_ms || env.CLI_TIMEOUT_MS;
-    const serviceMaxBytes = svc.max_output_bytes || env.CLI_MAX_OUTPUT_BYTES;
-    const serviceEnv = buildServiceEnv(process.env, svc.env || {});
+        // Look up the owning service from the dispatch table so per-call
+        // dispatch (CLI command, cwd, timeout, env) comes from box config.
+        const dispatch = toolDispatch.get(name);
+        if (!dispatch) throw new Error(`Tool dispatch missing: ${name}`);
+        // Log only the command/subcommand path. Never include callArgs.args,
+        // positional values, stdin, or any other user-supplied parameter values.
+        info = toolCallInfo(name, tool, callArgs);
+        const svc = box.config.services[dispatch.serviceName];
+        if (!svc) throw new Error(`Service not found for tool ${name}: ${dispatch.serviceName}`);
+        const serviceCwd = svc.cwd || env.CLI_CWD;
+        const serviceTimeout = svc.timeout_ms || env.CLI_TIMEOUT_MS;
+        const serviceMaxBytes = svc.max_output_bytes || env.CLI_MAX_OUTPUT_BYTES;
+        const serviceEnv = buildServiceEnv(process.env, svc.env || {});
 
-    // Synthetic "workspace" tool: read-only managed workspace. Returns a
-    // JSON-serialisable result envelope (dir / list / stat) directly, or an
-    // MCP content array (read with image blocks for PNG / JPEG / etc.). The
-    // workspace runtime was resolved at boot per-service; if it's null here,
-    // it means workspace is not active and the synthetic spec wouldn't be exposed
-    // — any caller that managed to reach this branch is a server bug.
-    //
-    // Intercept BEFORE the mcp-stdio/mcp-http forwarding branch so an
-    // upstream MCP that happens to expose its own tool called `workspace`
-    // cannot shadow the gateway's local synthetic one.
-    if (tool.dispatch && tool.dispatch.kind === "workspace") {
-      const runtime = perServiceWorkspace[dispatch.serviceName];
-      if (!runtime) {
-        throw new Error(
-          `workspace tool dispatched for service "${dispatch.serviceName}" ` +
-          `but workspace runtime is not active — server bug.`,
-        );
-      }
-      const result = await callWorkspace(runtime, callArgs);
-      // `dir` / `list` / `stat` return plain objects — wrap them in text
-      // so the MCP response is well-formed. `read` returns a content array
-      // directly.
-      if (Array.isArray(result?.content)) {
-        return result;
-      }
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
-    }
+        // Synthetic "workspace" tool: read-only managed workspace. Returns a
+        // JSON-serialisable result envelope (dir / list / stat) directly, or an
+        // MCP content array (read with image blocks for PNG / JPEG / etc.). The
+        // workspace runtime was resolved at boot per-service; if it's null here,
+        // it means workspace is not active and the synthetic spec wouldn't be exposed
+        // — any caller that managed to reach this branch is a server bug.
+        //
+        // Intercept BEFORE the mcp-stdio/mcp-http forwarding branch so an
+        // upstream MCP that happens to expose its own tool called `workspace`
+        // cannot shadow the gateway's local synthetic one.
+        if (tool.dispatch && tool.dispatch.kind === "workspace") {
+          const runtime = perServiceWorkspace[dispatch.serviceName];
+          if (!runtime) {
+            throw new Error(
+              `workspace tool dispatched for service "${dispatch.serviceName}" ` +
+              `but workspace runtime is not active — server bug.`,
+            );
+          }
+          const result = await callWorkspace(runtime, callArgs);
+          // `dir` / `list` / `stat` return plain objects — wrap them in text
+          // so the MCP response is well-formed. `read` returns a content array
+          // directly.
+          if (Array.isArray(result?.content)) {
+            return result;
+          }
+          return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        }
 
-    // Synthetic "help" tool (CLI adapter: `<cli> [sub] --help`) and
-    // synthetic "run" tool (CLI adapter: `<cli> <commandPath...> <args...>`):
-    // execute the underlying CLI verbatim. Same shape works for both — see
-    // the dispatch.kind branches below for adapter-specific handling.
-    //
-    // For mcp-stdio / mcp-http adapters, dispatch.kind=help synthesises a
-    // gateway-managed help page from the preserved upstream catalog (see
-    // upstreamMcpCatalog map below) and dispatch.kind=run forwards to the
-    // per-service MCP client using commandPath[0] as the upstream tool name
-    // and callArgs.args (object or array) as the tool arguments.
-    //
-    // We intercept these BEFORE the mcp forwarding branch so an MCP upstream
-    // tool with an awkward name such as `svc_help` cannot shadow the gateway's
-    // local synthetic one — and so the synthetic handlers don't fall through
-    // to "forward upstream as svc_help".
-    if (tool.dispatch && (tool.dispatch.kind === "help" || tool.dispatch.kind === "run")) {
-      return await dispatchSyntheticCall(tool, dispatch, callArgs, { serviceCwd, serviceTimeout, serviceMaxBytes, serviceEnv });
-    }
+        // Synthetic "help" tool (CLI adapter: `<cli> [sub] --help`) and
+        // synthetic "run" tool (CLI adapter: `<cli> <commandPath...> <args...>`):
+        // execute the underlying CLI verbatim. Same shape works for both — see
+        // the dispatch.kind branches below for adapter-specific handling.
+        //
+        // For mcp-stdio / mcp-http adapters, dispatch.kind=help synthesises a
+        // gateway-managed help page from the preserved upstream catalog (see
+        // upstreamMcpCatalog map below) and dispatch.kind=run forwards to the
+        // per-service MCP client using commandPath[0] as the upstream tool name
+        // and callArgs.args (object or array) as the tool arguments.
+        //
+        // We intercept these BEFORE the mcp forwarding branch so an MCP upstream
+        // tool with an awkward name such as `svc_help` cannot shadow the gateway's
+        // local synthetic one — and so the synthetic handlers don't fall through
+        // to "forward upstream as svc_help".
+        if (tool.dispatch && (tool.dispatch.kind === "help" || tool.dispatch.kind === "run")) {
+          return await dispatchSyntheticCall(tool, dispatch, callArgs, { serviceCwd, serviceTimeout, serviceMaxBytes, serviceEnv });
+        }
 
-    // mcp-stdio adapter: forward the call through the per-service MCP client
-    // we set up at boot. No subprocess spawn here — the stdio MCP server is
-    // already running, we just round-trip the JSON-RPC.
-    if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
-      const caller = perServiceCallers[dispatch.serviceName];
-      if (!caller) {
-        throw new Error(`MCP client missing for service ${dispatch.serviceName}`);
-      }
-      const result = await caller.callTool(dispatch.originalName || tool.originalName || name, callArgs);
-      // Forward upstream content blocks faithfully.  Earlier versions of this
-      // adapter flattened everything to text and stringified non-text blocks
-      // as `[image]`, which silently broke image / audio / binary tools.
-      // Now we preserve each block's type and payload so a tool that returns
-      // {type: "image", mimeType, data} stays an image content block on the
-      // way out.  Text blocks still pass through the legacy max-bytes cap.
-      const blocks = result.content || [];
-      const textBlocks = blocks.filter(c => c.type === "text");
-      const otherBlocks = blocks.filter(c => c.type !== "text");
-      let text = textBlocks.map(c => c.text).join("\n");
-      if (text.length > serviceMaxBytes) {
-        const hint = `\n\n[TRUNCATED: text output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
-        text = text.slice(0, serviceMaxBytes) + hint;
-      }
-      const outBlocks = text.length > 0 ? [{ type: "text", text }] : [];
-      outBlocks.push(...otherBlocks);
-      return {
-        content: outBlocks,
-        ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
-        isError: Boolean(result.isError),
-      };
-    }
+        // mcp-stdio adapter: forward the call through the per-service MCP client
+        // we set up at boot. No subprocess spawn here — the stdio MCP server is
+        // already running, we just round-trip the JSON-RPC.
+        if (svc.adapter === "mcp-stdio" || svc.adapter === "mcp-http") {
+          const caller = perServiceCallers[dispatch.serviceName];
+          if (!caller) {
+            throw new Error(`MCP client missing for service ${dispatch.serviceName}`);
+          }
+          const result = await caller.callTool(dispatch.originalName || tool.originalName || name, callArgs);
+          // Forward upstream content blocks faithfully.  Earlier versions of this
+          // adapter flattened everything to text and stringified non-text blocks
+          // as `[image]`, which silently broke image / audio / binary tools.
+          // Now we preserve each block's type and payload so a tool that returns
+          // {type: "image", mimeType, data} stays an image content block on the
+          // way out.  Text blocks still pass through the legacy max-bytes cap.
+          const blocks = result.content || [];
+          const textBlocks = blocks.filter(c => c.type === "text");
+          const otherBlocks = blocks.filter(c => c.type !== "text");
+          let text = textBlocks.map(c => c.text).join("\n");
+          if (text.length > serviceMaxBytes) {
+            const hint = `\n\n[TRUNCATED: text output was ${text.length} bytes, only first ${serviceMaxBytes} shown.]`;
+            text = text.slice(0, serviceMaxBytes) + hint;
+          }
+          const outBlocks = text.length > 0 ? [{ type: "text", text }] : [];
+          outBlocks.push(...otherBlocks);
+          return {
+            content: outBlocks,
+            ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
+            isError: Boolean(result.isError),
+          };
+        }
 
-    // Synthetic "help" / "run" dispatch lives in dispatchSyntheticCall below so
-    // the same handler covers CLI and MCP adapters — and crucially so the
-    // synthetic routes are evaluated BEFORE the mcp-stdio / mcp-http
-    // forwarding branch (an upstream tool named `<svc>_help` would otherwise
-    // shadow the synthetic one).
-    if (tool.dispatch && (tool.dispatch.kind === "help" || tool.dispatch.kind === "run")) {
-      return await dispatchSyntheticCall(tool, dispatch, callArgs, { serviceCwd, serviceTimeout, serviceMaxBytes, serviceEnv });
-    }
+        // Synthetic "help" / "run" dispatch lives in dispatchSyntheticCall below so
+        // the same handler covers CLI and MCP adapters — and crucially so the
+        // synthetic routes are evaluated BEFORE the mcp-stdio / mcp-http
+        // forwarding branch (an upstream tool named `<svc>_help` would otherwise
+        // shadow the synthetic one).
+        if (tool.dispatch && (tool.dispatch.kind === "help" || tool.dispatch.kind === "run")) {
+          return await dispatchSyntheticCall(tool, dispatch, callArgs, { serviceCwd, serviceTimeout, serviceMaxBytes, serviceEnv });
+        }
 
-    const argv = [...(svc.args || [])];
-    const commandPath = Array.isArray(tool.dispatch.commandPath)
-      ? tool.dispatch.commandPath
-      : (tool.dispatch.subcommand ? [tool.dispatch.subcommand] : []);
-    if (commandPath.length > 0) argv.push(...commandPath);
-    argv.push(...buildArgv(tool.dispatch.shape, callArgs));
-    const startedAt = process.hrtime.bigint();
-    let r;
-    try {
-      r = await execa(svc.command, argv, {
-        cwd: serviceCwd,
-        timeout: serviceTimeout,
-        reject: false,
-        env: serviceEnv,
-        extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
-        encoding: "buffer",
-        input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
-      });
-    } catch (error) {
-      const elapsedMs = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
-      if (error.timedOut || error.code === "ETIMEDOUT") {
-        const timeoutStdout = Buffer.isBuffer(error.stdout) ? error.stdout.length : Buffer.byteLength(error.stdout || "");
-        const timeoutStderr = Buffer.isBuffer(error.stderr) ? error.stderr.length : Buffer.byteLength(error.stderr || "");
-        return cliFailure("timeout", `Command timed out after ${serviceTimeout} ms; retry with narrower arguments.`, {
-          timeoutMs: serviceTimeout, elapsedMs, stdoutBytes: timeoutStdout, stderrBytes: timeoutStderr,
-          exitCode: error.exitCode ?? null, recoverable: true,
-        });
-      }
-      throw error;
-    }
-    const elapsedMs = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
-    const stdoutBuffer = Buffer.isBuffer(r.stdout) ? r.stdout : Buffer.from(r.stdout || "");
-    const stderrBuffer = Buffer.isBuffer(r.stderr) ? r.stderr : Buffer.from(r.stderr || "");
-    const stdoutBytes = stdoutBuffer.length;
-    const stderrBytes = stderrBuffer.length;
-    let text;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(stdoutBuffer);
-    } catch {
-      return cliFailure("invalid_utf8", "Command output is not valid UTF-8.", {
-        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-      });
-    }
-    if (r.timedOut) {
-      return cliFailure("timeout", `Command timed out after ${serviceTimeout} ms; retry with narrower arguments.`, {
-        timeoutMs: serviceTimeout, stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs, recoverable: true,
-      });
-    }
-    if (r.exitCode !== 0) {
-      return cliFailure("command_failed", `Command failed with exit code ${r.exitCode}.`, {
-        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-      });
-    }
+        const argv = [...(svc.args || [])];
+        const commandPath = Array.isArray(tool.dispatch.commandPath)
+          ? tool.dispatch.commandPath
+          : (tool.dispatch.subcommand ? [tool.dispatch.subcommand] : []);
+        if (commandPath.length > 0) argv.push(...commandPath);
+        argv.push(...buildArgv(tool.dispatch.shape, callArgs));
+        const startedAt = process.hrtime.bigint();
+        let r;
+        try {
+          r = await execa(svc.command, argv, {
+            cwd: serviceCwd,
+            timeout: serviceTimeout,
+            reject: false,
+            env: serviceEnv,
+            extendEnv: false,  // strip parent process env (incl. hermes task tokens) — see service-env.mjs
+            encoding: "buffer",
+            input: typeof callArgs.stdin === "string" ? callArgs.stdin : undefined,
+          });
+        } catch (error) {
+          const elapsedMs = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
+          if (error.timedOut || error.code === "ETIMEDOUT") {
+            const timeoutStdout = Buffer.isBuffer(error.stdout) ? error.stdout.length : Buffer.byteLength(error.stdout || "");
+            const timeoutStderr = Buffer.isBuffer(error.stderr) ? error.stderr.length : Buffer.byteLength(error.stderr || "");
+            return cliFailure("timeout", `Command timed out after ${serviceTimeout} ms; retry with narrower arguments.`, {
+              timeoutMs: serviceTimeout, elapsedMs, stdoutBytes: timeoutStdout, stderrBytes: timeoutStderr,
+              exitCode: error.exitCode ?? null, recoverable: true,
+            });
+          }
+          throw error;
+        }
+        const elapsedMs = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
+        const stdoutBuffer = Buffer.isBuffer(r.stdout) ? r.stdout : Buffer.from(r.stdout || "");
+        const stderrBuffer = Buffer.isBuffer(r.stderr) ? r.stderr : Buffer.from(r.stderr || "");
+        const stdoutBytes = stdoutBuffer.length;
+        const stderrBytes = stderrBuffer.length;
+        let text;
+        try {
+          text = new TextDecoder("utf-8", { fatal: true }).decode(stdoutBuffer);
+        } catch {
+          return cliFailure("invalid_utf8", "Command output is not valid UTF-8.", {
+            stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+          });
+        }
+        if (r.timedOut) {
+          return cliFailure("timeout", `Command timed out after ${serviceTimeout} ms; retry with narrower arguments.`, {
+            timeoutMs: serviceTimeout, stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs, recoverable: true,
+          });
+        }
+        if (r.exitCode !== 0) {
+          return cliFailure("command_failed", `Command failed with exit code ${r.exitCode}.`, {
+            stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+          });
+        }
 
-    // Truncate very large stdout. Help tool already short-circuited above and
-    // is exempt; every other tool gets the same budget.
-    if (stdoutBytes > serviceMaxBytes) {
-      return cliFailure("output_limit", `Command output is ${stdoutBytes} bytes; limit is ${serviceMaxBytes}.`, {
-        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-        maxOutputBytes: serviceMaxBytes, recoverable: true, ...outputStats(text),
-      });
-    }
-    // Multica CLI may wrap MCP results in a JSON envelope. Preserve its blocks
-    // and structured content before the generic plain-text output cap runs.
-    try {
-      const envelope = parseMcpEnvelope(text);
-      if (envelope) return envelope;
-    } catch {
-      return cliFailure("invalid_mcp_envelope", "Command returned a malformed MCP result envelope.", {
-        stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-      });
-    }
-    if (jsonOutputRequested(argv)) {
-      try { JSON.parse(text); } catch {
-        return cliFailure("invalid_json", "Command was asked for JSON but returned malformed JSON.", {
-          stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
-        });
-      }
-    }
-    return { content: [{ type: "text", text }] };
+        // Truncate very large stdout. Help tool already short-circuited above and
+        // is exempt; every other tool gets the same budget.
+        if (stdoutBytes > serviceMaxBytes) {
+          return cliFailure("output_limit", `Command output is ${stdoutBytes} bytes; limit is ${serviceMaxBytes}.`, {
+            stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+            maxOutputBytes: serviceMaxBytes, recoverable: true, ...outputStats(text),
+          });
+        }
+        // Multica CLI may wrap MCP results in a JSON envelope. Preserve its blocks
+        // and structured content before the generic plain-text output cap runs.
+        try {
+          const envelope = parseMcpEnvelope(text);
+          if (envelope) return envelope;
+        } catch {
+          return cliFailure("invalid_mcp_envelope", "Command returned a malformed MCP result envelope.", {
+            stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+          });
+        }
+        if (jsonOutputRequested(argv)) {
+          try { JSON.parse(text); } catch {
+            return cliFailure("invalid_json", "Command was asked for JSON but returned malformed JSON.", {
+              stdoutBytes, stderrBytes, exitCode: r.exitCode, elapsedMs,
+            });
+          }
+        }
+        return { content: [{ type: "text", text }] };
+    });
   });
   return server;
 }
@@ -1461,7 +1468,8 @@ async function runHttp() {
     console.log(`cors origins: ${env.CORS_ORIGINS.length ? env.CORS_ORIGINS.join(", ") : "(none — browser clients blocked)"}`);
     console.log(`rate limit: ${env.RATE_LIMIT_RPS} rps / burst ${env.RATE_LIMIT_BURST}`);
     if (["bearer", "both"].includes(env.AUTH_MODE)) {
-      console.log(`bearer token: ${env.TOKEN}`);
+      // Never write credentials to stdout: managed runtimes persist this log.
+      console.log("bearer auth enabled (token redacted; configure MCP_TOKEN out of band)");
     }
     if (oauthNeeded) console.log(`oauth issuer: ${env.OAUTH_ISSUER}`);
   });
