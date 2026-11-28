@@ -327,6 +327,16 @@ the exact legacy behavior.
 | `structured` | Require valid JSON and return the original text block plus `structuredContent: { data: parsedValue }`. Supports objects, arrays, strings, numbers, booleans, and null. A native MCP envelope still takes precedence. |
 | `mcp` | Require one complete native MCP result envelope. Plain JSON/text becomes an `isError` tool result. |
 
+Choose the mode from the command's expected output. Prefer `structured` for
+commands expected to return JSON (`--output json`, `--format json`, or
+`--with-content` when JSON is expected), especially when complete structured
+fields are needed. Prefer `text` for plain-text output, and `mcp` for commands
+known to emit native MCP envelopes. Use `auto` for service-configured automatic
+selection or legacy compatibility; when `auto_json` is disabled, explicitly
+select `structured` for JSON if structured fields are needed. `--with-content`
+does not by itself guarantee JSON output. Native envelopes take precedence in
+every mode. `responseMode` is Gateway-only and is never passed as a CLI arg.
+
 Native envelopes are recognized only when the complete trimmed stdout is a
 valid Gateway envelope. Their text/image/audio and other typed blocks,
 `structuredContent`, and `isError` are preserved; the Gateway never guesses

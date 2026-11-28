@@ -140,10 +140,17 @@ test("triple-mode multica_run exposes responseMode and adapts CLI results over M
       assert.deepEqual(runSchema.properties.responseMode.enum, ["auto", "text", "structured", "mcp"]);
       assert.match(runSchema.properties.responseMode.description, /not passed to the CLI/);
       assert.match(runTool.description, /Gateway-only responseMode/);
+      for (const advice of ["Prefer structured", "--output json", "--format json", "--with-content when JSON is expected", "Prefer text", "Use mcp", "Use auto", "Native envelopes take precedence", "Gateway-only, not CLI args"]) {
+        assert.ok(runSchema.properties.responseMode.description.includes(advice), `schema responseMode guidance missing ${advice}`);
+        assert.ok(runTool.description.includes(advice), `tools/list description missing ${advice}`);
+      }
       assert.equal(runTool.outputSchema, undefined);
 
       const help = await callTool("multica_help", {});
       assert.match(help.result.content[0].text, /responseMode is a Gateway-only parameter/);
+      for (const advice of ["Prefer structured", "--output json", "--format json", "--with-content when JSON is expected", "Prefer text", "Use mcp", "Use auto", "Native envelopes take precedence", "Gateway-only, not CLI args"]) {
+        assert.ok(help.result.content[0].text.includes(advice), `_help guidance missing ${advice}`);
+      }
       assert.match(help.result.content[0].text, /raw help below documents CLI arguments only/);
 
       const call = async (commandPath, args, extra = {}) => {
